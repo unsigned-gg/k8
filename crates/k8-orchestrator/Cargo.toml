@@ -1,0 +1,23 @@
+[package]
+name = "k8-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Kubernetes agent orchestrator engine: job scheduler, security jail context, and reaper"
+
+[dependencies]
+k8-core = { workspace = true }
+k8-api = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

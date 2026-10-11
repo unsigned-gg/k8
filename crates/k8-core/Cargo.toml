@@ -1,0 +1,19 @@
+[package]
+name = "k8-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core Kubernetes client, cluster configuration, and primitives for k8"
+
+[dependencies]
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

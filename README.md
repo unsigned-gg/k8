@@ -1,4 +1,4 @@
-# k8 [![crates.io](https://img.shields.io/crates/v/k8.svg)](https://crates.io/crates/k8) [![docs.rs](https://docs.rs/k8/badge.svg)](https://docs.rs/k8) [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE-APACHE)
+# k8 [![crates.io](https://img.shields.io/crates/v/k8.svg)](https://crates.io/crates/k8) [![docs.rs](https://docs.rs/k8/badge.svg)](https://docs.rs/k8) [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](https://github.com/unsigned-gg/.github)
 
 > **k8**: Kubernetes agent orchestrator, workload controller, and native CLI tooling for autonomous agent fleets.
 
@@ -84,3 +84,7 @@ Licensed under either of:
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
+
+## Principles
+
+See the [unsigned-gg principles](https://github.com/unsigned-gg/.github) for the architectural doctrine and community standards.

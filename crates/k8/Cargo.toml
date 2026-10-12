@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+publish = false
 description = "Kubernetes agent orchestrator, workload controller, and native CLI tooling for autonomous agent fleets"
 
 [[bin]]

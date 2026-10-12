@@ -67,7 +67,6 @@ pub enum WorkloadPhase {
     Terminated,
 }
 
-
 /// Status block of an AgentWorkload.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, JsonSchema)]
 pub struct AgentWorkloadStatus {
@@ -93,4 +92,76 @@ pub struct AgentWorkloadStatus {
     /// Completion timestamp (ISO8601).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kube::CustomResourceExt;
+
+    #[test]
+    fn test_workload_phase_default() {
+        assert_eq!(WorkloadPhase::default(), WorkloadPhase::Pending);
+    }
+
+    #[test]
+    fn test_agent_workload_crd_metadata() {
+        let crd = AgentWorkload::crd();
+        assert_eq!(crd.spec.group, "agent.unsigned.gg");
+        assert_eq!(crd.spec.names.kind, "AgentWorkload");
+        assert_eq!(crd.spec.names.short_names, Some(vec!["aw".to_string()]));
+    }
+
+    #[test]
+    fn test_spec_serialization_roundtrip() {
+        let mut env = BTreeMap::new();
+        env.insert("AGENT_ROLE".to_string(), "arbitrator".to_string());
+
+        let spec = AgentWorkloadSpec {
+            image: "ghcr.io/unsigned-gg/agent:latest".to_string(),
+            command: vec!["agent".to_string()],
+            args: vec!["--verify".to_string()],
+            env,
+            cpu: Some("2000m".to_string()),
+            memory: Some("4Gi".to_string()),
+            gpu: Some(1),
+            timeout_seconds: Some(3600),
+            agent_role: Some("researcher".to_string()),
+        };
+
+        let json = serde_json::to_string(&spec).expect("serialize spec");
+        let parsed: AgentWorkloadSpec = serde_json::from_str(&json).expect("deserialize spec");
+
+        assert_eq!(parsed.image, spec.image);
+        assert_eq!(parsed.command, spec.command);
+        assert_eq!(parsed.args, spec.args);
+        assert_eq!(
+            parsed.env.get("AGENT_ROLE"),
+            Some(&"arbitrator".to_string())
+        );
+        assert_eq!(parsed.cpu, Some("2000m".to_string()));
+        assert_eq!(parsed.memory, Some("4Gi".to_string()));
+        assert_eq!(parsed.gpu, Some(1));
+        assert_eq!(parsed.timeout_seconds, Some(3600));
+        assert_eq!(parsed.agent_role, Some("researcher".to_string()));
+    }
+
+    #[test]
+    fn test_status_serialization_roundtrip() {
+        let status = AgentWorkloadStatus {
+            phase: WorkloadPhase::Running,
+            pod_name: Some("agent-run-1".to_string()),
+            exit_code: None,
+            message: Some("Execution active".to_string()),
+            started_at: Some("2026-10-12T00:00:00Z".to_string()),
+            completed_at: None,
+        };
+
+        let json = serde_json::to_string(&status).expect("serialize status");
+        let parsed: AgentWorkloadStatus = serde_json::from_str(&json).expect("deserialize status");
+
+        assert_eq!(parsed.phase, WorkloadPhase::Running);
+        assert_eq!(parsed.pod_name, Some("agent-run-1".to_string()));
+        assert_eq!(parsed.message, Some("Execution active".to_string()));
+    }
 }

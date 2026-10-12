@@ -20,6 +20,14 @@
 
 ---
 
+## Specifications & Roadmap
+
+- **Architecture Roadmap**: [`ROADMAP.md`](ROADMAP.md)
+- **Formal Specifications**: [`specs/`](specs/)
+  - [`SPEC-0001: k8 Architecture, Operational Invariants & Multi-Horizon Roadmap`](specs/SPEC-0001-k8-architecture-and-roadmap.md)
+
+---
+
 ## Installation
 
 ```bash

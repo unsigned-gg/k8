@@ -80,7 +80,10 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "k8=info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "k8=info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -158,9 +161,14 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon => {
-            println!("Starting k8 agent orchestrator daemon in namespace: {}", client.namespace());
+            println!(
+                "Starting k8 agent orchestrator daemon in namespace: {}",
+                client.namespace()
+            );
             println!("Listening for autonomous agent workload CRDs and job signals...");
-            tokio::signal::ctrl_c().await.expect("failed to listen for event");
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to listen for event");
             println!("Received shutdown signal. Exiting k8 daemon.");
         }
     }

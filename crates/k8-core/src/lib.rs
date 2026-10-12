@@ -36,8 +36,7 @@ impl K8Client {
     /// Create a new `K8Client` using standard default config (in-cluster SA or local kubeconfig).
     pub async fn default_client() -> Result<Self> {
         let client = Client::try_default().await?;
-        let namespace = std::env::var("K8S_NAMESPACE")
-            .unwrap_or_else(|_| "default".to_string());
+        let namespace = std::env::var("K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
         Ok(Self { client, namespace })
     }
 
@@ -55,5 +54,25 @@ impl K8Client {
     /// Return the active default namespace.
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_k8_error_display() {
+        let err = K8Error::Config("missing kubeconfig".to_string());
+        assert_eq!(err.to_string(), "Configuration error: missing kubeconfig");
+
+        let not_found = K8Error::NotFound("pod-123".to_string());
+        assert_eq!(not_found.to_string(), "Resource not found: pod-123");
+
+        let timeout = K8Error::Timeout("timed out waiting for ready".to_string());
+        assert_eq!(
+            timeout.to_string(),
+            "Timeout waiting for resource: timed out waiting for ready"
+        );
     }
 }

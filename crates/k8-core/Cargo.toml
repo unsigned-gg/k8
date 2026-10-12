@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "Core Kubernetes client, cluster configuration, and primitives for k8"
 
 [dependencies]

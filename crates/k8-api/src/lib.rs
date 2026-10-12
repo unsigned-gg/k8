@@ -57,8 +57,9 @@ pub struct AgentWorkloadSpec {
 }
 
 /// Execution phase for an AgentWorkload.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub enum WorkloadPhase {
+    #[default]
     Pending,
     Running,
     Succeeded,
@@ -66,11 +67,6 @@ pub enum WorkloadPhase {
     Terminated,
 }
 
-impl Default for WorkloadPhase {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 /// Status block of an AgentWorkload.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, JsonSchema)]

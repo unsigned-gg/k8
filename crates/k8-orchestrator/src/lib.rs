@@ -2,8 +2,16 @@
 //! `k8-orchestrator`: Engine for scheduling, PodSecurity `restricted` sandboxing, and reconciling
 //! autonomous agent workloads on Kubernetes.
 
+pub mod reconciler;
+
+pub use reconciler::{
+    reconcile_workload_pure, ReconcileEffect, ReconcileObservation, ReconcilePlan,
+};
+
 use k8_api::{
-    audit_pod_spec_restricted, canonical_workload_labels, restricted_container_security_context,
+    audit_pod_spec_restricted, build_isolated_network_policy, build_workload_pdb,
+    build_workload_tolerations, canonical_workload_labels, ensure_cleanup_finalizer,
+    remove_cleanup_finalizer, restricted_container_security_context,
     restricted_pod_security_context, to_yaml_manifest, AgentWorkload, AgentWorkloadSpec,
     WorkloadPhase, LABEL_MANAGED_BY,
 };
@@ -13,7 +21,7 @@ use k8s_openapi::api::core::v1::{
     Container, EnvVar, PodSpec, PodTemplateSpec, ResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube::api::Api;
 use std::collections::BTreeMap;
 use tracing::info;
@@ -46,6 +54,17 @@ impl Orchestrator {
         run_id: &str,
         namespace: &str,
         spec: &AgentWorkloadSpec,
+    ) -> Result<Job> {
+        Self::build_validated_job_with_owner(run_id, namespace, spec, None)
+    }
+
+    /// Validate `spec` and construct a PodSecurity `restricted` Kubernetes [`Job`] with an optional
+    /// controller [`OwnerReference`], Kata microVM `runtimeClassName`, and node taint tolerations.
+    pub fn build_validated_job_with_owner(
+        run_id: &str,
+        namespace: &str,
+        spec: &AgentWorkloadSpec,
+        owner_ref: Option<OwnerReference>,
     ) -> Result<Job> {
         let req = spec.validate()?;
         let labels = canonical_workload_labels(run_id, spec.agent_role.as_deref())
@@ -95,9 +114,21 @@ impl Orchestrator {
             ..Default::default()
         };
 
+        let tolerations = build_workload_tolerations(req.gpu, true);
+        let runtime_class_name = spec
+            .isolation_profile
+            .runtime_class_name()
+            .map(str::to_string);
+
         let pod_spec = PodSpec {
             automount_service_account_token: Some(false),
             restart_policy: Some("Never".to_string()),
+            runtime_class_name,
+            tolerations: if tolerations.is_empty() {
+                None
+            } else {
+                Some(tolerations)
+            },
             containers: vec![container],
             security_context: Some(restricted_pod_security_context()),
             ..Default::default()
@@ -112,6 +143,7 @@ impl Orchestrator {
                 name: Some(run_id.to_string()),
                 namespace: Some(namespace.to_string()),
                 labels: Some(labels.clone()),
+                owner_references: owner_ref.map(|o| vec![o]),
                 ..Default::default()
             },
             spec: Some(JobSpec {
@@ -150,6 +182,36 @@ impl Orchestrator {
         Ok(to_yaml_manifest(&job)?)
     }
 
+    /// Validate `spec` and render a full zero-trust Kubernetes YAML 1.2 bundle containing
+    /// `NetworkPolicy`, `PodDisruptionBudget`, and `Job` separated by `---`.
+    pub fn render_workload_bundle_yaml(
+        run_id: &str,
+        namespace: &str,
+        spec: &AgentWorkloadSpec,
+    ) -> Result<String> {
+        let job = Self::build_validated_job(run_id, namespace, spec)?;
+        let netpol = build_isolated_network_policy(
+            run_id,
+            namespace,
+            spec.agent_role.as_deref(),
+            spec.egress.as_ref(),
+        )
+        .map_err(k8_api::SpecValidationError::from)?;
+        let pdb = build_workload_pdb(run_id, namespace, spec.agent_role.as_deref(), 1)
+            .map_err(k8_api::SpecValidationError::from)?;
+
+        let netpol_yaml = to_yaml_manifest(&netpol)?;
+        let pdb_yaml = to_yaml_manifest(&pdb)?;
+        let job_yaml = to_yaml_manifest(&job)?;
+
+        Ok(format!(
+            "{}\n---\n{}\n---\n{}",
+            netpol_yaml.trim_end(),
+            pdb_yaml.trim_end(),
+            job_yaml
+        ))
+    }
+
     /// Deterministically evaluate the [`WorkloadPhase`] of a Kubernetes [`Job`].
     #[must_use]
     pub fn evaluate_job_phase(job: &Job) -> WorkloadPhase {
@@ -176,6 +238,65 @@ impl Orchestrator {
             .as_deref()
             .ok_or_else(|| K8Error::Config("AgentWorkload metadata.name is required".into()))?;
         self.client.apply_namespaced(name, workload, true).await
+    }
+
+    /// Execute a pure [`ReconcilePlan`] against the Kubernetes API server via Server-Side Apply.
+    pub async fn execute_reconcile_plan(
+        &self,
+        workload: &AgentWorkload,
+        plan: &ReconcilePlan,
+    ) -> Result<()> {
+        let name = workload
+            .metadata
+            .name
+            .as_deref()
+            .ok_or_else(|| K8Error::Config("AgentWorkload metadata.name is required".into()))?;
+
+        for effect in &plan.effects {
+            match effect {
+                ReconcileEffect::EnsureFinalizer => {
+                    let mut patched = workload.clone();
+                    if ensure_cleanup_finalizer(&mut patched.metadata) {
+                        self.client.apply_namespaced(name, &patched, true).await?;
+                    }
+                }
+                ReconcileEffect::ApplyNetworkPolicy(netpol) => {
+                    let netpol_name = netpol
+                        .metadata
+                        .name
+                        .as_deref()
+                        .ok_or_else(|| K8Error::Config("NetworkPolicy name missing".into()))?;
+                    self.client
+                        .apply_namespaced(netpol_name, netpol.as_ref(), true)
+                        .await?;
+                }
+                ReconcileEffect::ApplyChildJob(job) => {
+                    let job_name = job
+                        .metadata
+                        .name
+                        .as_deref()
+                        .ok_or_else(|| K8Error::Config("Job name missing".into()))?;
+                    self.client
+                        .apply_namespaced(job_name, job.as_ref(), true)
+                        .await?;
+                }
+                ReconcileEffect::DeleteChildJob(run_id) => {
+                    self.terminate(run_id).await?;
+                }
+                ReconcileEffect::PatchWorkloadStatus(status) => {
+                    let mut patched = workload.clone();
+                    patched.status = Some(status.clone());
+                    self.client.patch_status_namespaced(name, &patched).await?;
+                }
+                ReconcileEffect::RemoveFinalizer => {
+                    let mut patched = workload.clone();
+                    if remove_cleanup_finalizer(&mut patched.metadata) {
+                        self.client.apply_namespaced(name, &patched, true).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Dispatch a new agent [`Job`] onto the cluster using Server-Side Apply and PodSecurity `restricted` isolation.
@@ -219,6 +340,7 @@ impl Orchestrator {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use k8_api::{from_multi_yaml_manifests, EgressRuleSpec, IsolationProfile, ManifestHeader};
     use k8s_openapi::api::batch::v1::JobStatus;
 
     #[test]
@@ -236,6 +358,12 @@ mod tests {
             gpu: Some(1),
             timeout_seconds: Some(3600),
             agent_role: Some("researcher".to_string()),
+            isolation_profile: IsolationProfile::KataMicroVm,
+            egress: Some(EgressRuleSpec {
+                allow_dns: true,
+                allowed_cidrs: vec!["10.42.0.0/16".to_string()],
+                allowed_tcp_ports: vec![443],
+            }),
         };
 
         let job = Orchestrator::build_validated_job("agent-test1234", "agent-ns", &spec)
@@ -268,12 +396,23 @@ mod tests {
 
         let pod_spec = job_spec.template.spec.expect("pod spec present");
         assert_eq!(pod_spec.automount_service_account_token, Some(false));
+        assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata"));
+        assert_eq!(pod_spec.tolerations.as_ref().map(Vec::len), Some(2));
         assert!(audit_pod_spec_restricted(&pod_spec).is_ok());
 
         let yaml = Orchestrator::render_job_yaml("agent-test1234", "agent-ns", &spec)
             .expect("render job yaml");
         assert!(yaml.contains("agent-test1234"));
         assert!(yaml.contains("RuntimeDefault"));
+
+        let bundle = Orchestrator::render_workload_bundle_yaml("agent-test1234", "agent-ns", &spec)
+            .expect("render bundle yaml");
+        let headers: Vec<ManifestHeader> =
+            from_multi_yaml_manifests(&bundle).expect("parse multi-doc bundle");
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[0].kind, "NetworkPolicy");
+        assert_eq!(headers[1].kind, "PodDisruptionBudget");
+        assert_eq!(headers[2].kind, "Job");
     }
 
     #[test]

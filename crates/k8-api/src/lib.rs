@@ -1,22 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-//! `k8-api`: Wave-0 zero-I/O Kubernetes CRD schemas, resource quantities, YAML 1.2 manifests,
-//! PodSecurity `restricted` invariants, and BFT jury primitives.
+//! `k8-api`: Zero-I/O Kubernetes CRD schemas, resource quantities, YAML 1.2 manifests,
+//! PodSecurity `restricted` invariants, `OwnerReference` & finalizer lifecycle algebra,
+//! zero-trust `NetworkPolicy` builders, scheduling primitives, and `3f + 1` BFT jury quorums.
 
 pub mod jury;
+pub mod lifecycle;
 pub mod manifest;
+pub mod network;
 pub mod quantity;
+pub mod scheduling;
 pub mod security;
 pub mod selector;
 
 pub use jury::{
     EquivocationFault, ExecutionReceipt, JuryError, JuryQuorum, JuryVote, VerdictOutcome,
 };
+pub use lifecycle::{
+    controller_owner_reference, ensure_cleanup_finalizer, find_condition, has_cleanup_finalizer,
+    has_controller_owner_reference, is_condition_true, is_deleting, remove_cleanup_finalizer,
+    upsert_condition, LifecycleError, AGENT_WORKLOAD_API_VERSION, AGENT_WORKLOAD_KIND,
+    CONDITION_ACCEPTED, CONDITION_DISPATCHED, CONDITION_JURY_VERIFIED, CONDITION_READY,
+    CONDITION_SANDBOXED, FINALIZER_WORKLOAD_CLEANUP,
+};
 pub use manifest::{
     from_multi_yaml_manifests, from_yaml_manifest, render_multi_yaml_manifests, to_yaml_manifest,
     ManifestError, ManifestHeader, ManifestMetadata,
 };
+pub use network::{
+    audit_network_policy_zero_trust, build_isolated_network_policy, validate_non_wildcard_cidr,
+    EgressRuleSpec, NetworkPolicyError,
+};
 pub use quantity::{
     CpuQuantity, MemoryQuantity, QuantityError, ResourceQuotaSpec, ResourceRequest, ResourceUsage,
+};
+pub use scheduling::{
+    build_hostname_spread_constraint, build_workload_pdb, build_workload_tolerations,
+    IsolationProfile, RUNTIME_CLASS_KATA, TAINT_KEY_AGENT_POOL, TAINT_KEY_GPU,
+    TOPOLOGY_KEY_HOSTNAME,
 };
 pub use security::{
     audit_pod_spec_restricted, restricted_container_security_context,
@@ -56,6 +76,10 @@ pub enum SpecValidationError {
     /// Agent role or label failed RFC 1123 DNS validation.
     #[error("invalid label or agent_role in workload spec: {0}")]
     InvalidLabel(#[from] LabelError),
+
+    /// Zero-trust egress specification failed CIDR or port validation.
+    #[error("invalid network egress rule in workload spec: {0}")]
+    InvalidNetworkPolicy(#[from] NetworkPolicyError),
 
     /// Timeout is zero or exceeds [`MAX_TIMEOUT_SECONDS`].
     #[error("timeout_seconds ({0}) must be between 1 and {MAX_TIMEOUT_SECONDS}")]
@@ -116,6 +140,14 @@ pub struct AgentWorkloadSpec {
     /// Active agent role label (for example `"researcher"`, `"critic"`, `"builder"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
+
+    /// Container kernel/microVM isolation profile (`standard-restricted` or `kata-micro-vm`).
+    #[serde(default)]
+    pub isolation_profile: IsolationProfile,
+
+    /// Optional zero-trust outbound network egress rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressRuleSpec>,
 }
 
 impl AgentWorkloadSpec {
@@ -134,6 +166,17 @@ impl AgentWorkloadSpec {
 
         if let Some(role) = &self.agent_role {
             validate_dns1123_label(role)?;
+        }
+
+        if let Some(egress) = &self.egress {
+            for cidr in &egress.allowed_cidrs {
+                validate_non_wildcard_cidr(cidr)?;
+            }
+            if egress.allowed_tcp_ports.contains(&0) {
+                return Err(SpecValidationError::InvalidNetworkPolicy(
+                    NetworkPolicyError::InvalidPortZero,
+                ));
+            }
         }
 
         if let Some(timeout) = self.timeout_seconds {
@@ -226,6 +269,10 @@ pub struct AgentWorkloadStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
 
+    /// Cryptographic BLAKE3 receipt digest (`ExecutionReceipt`) once jury verification succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_digest: Option<String>,
+
     /// Standard Kubernetes condition observations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<WorkloadCondition>,
@@ -268,6 +315,12 @@ mod tests {
             gpu: Some(1),
             timeout_seconds: Some(3600),
             agent_role: Some("researcher".to_string()),
+            isolation_profile: IsolationProfile::KataMicroVm,
+            egress: Some(EgressRuleSpec {
+                allow_dns: true,
+                allowed_cidrs: vec!["10.42.0.0/16".to_string()],
+                allowed_tcp_ports: vec![443],
+            }),
         };
 
         let req = spec.validate().expect("valid spec");
@@ -310,6 +363,20 @@ mod tests {
             bad_timeout.validate(),
             Err(SpecValidationError::InvalidTimeout(0))
         ));
+
+        let bad_egress = AgentWorkloadSpec {
+            image: "ghcr.io/unsigned-gg/agent:latest".to_string(),
+            egress: Some(EgressRuleSpec {
+                allow_dns: true,
+                allowed_cidrs: vec!["0.0.0.0/0".to_string()],
+                allowed_tcp_ports: vec![443],
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            bad_egress.validate(),
+            Err(SpecValidationError::InvalidNetworkPolicy(_))
+        ));
     }
 
     #[test]
@@ -321,6 +388,7 @@ mod tests {
             message: Some("Execution active".to_string()),
             started_at: Some("2026-10-12T00:00:00Z".to_string()),
             completed_at: None,
+            receipt_digest: None,
             conditions: vec![WorkloadCondition {
                 type_: "Sandboxed".to_string(),
                 status: "True".to_string(),

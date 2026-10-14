@@ -229,6 +229,12 @@ impl JuryQuorum {
         Ok(self.try_finalize(ts))
     }
 
+    /// Attempt to finalize an [`ExecutionReceipt`] if at least $2f + 1$ matching votes exist.
+    #[must_use]
+    pub fn finalize_receipt(&self, finalized_at_ms: u64) -> Option<ExecutionReceipt> {
+        self.try_finalize(finalized_at_ms)
+    }
+
     fn try_finalize(&self, finalized_at_ms: u64) -> Option<ExecutionReceipt> {
         let threshold = self.quorum_threshold();
         let mut tallies: BTreeMap<(VerdictOutcome, &str), Vec<String>> = BTreeMap::new();

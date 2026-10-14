@@ -6,14 +6,19 @@
 
 use crate::Orchestrator;
 use k8_api::{
-    build_isolated_network_policy, controller_owner_reference, has_cleanup_finalizer, is_deleting,
-    upsert_condition, AgentWorkload, AgentWorkloadStatus, ExecutionReceipt, VerdictOutcome,
-    WorkloadCondition, WorkloadPhase, CONDITION_ACCEPTED, CONDITION_DISPATCHED,
-    CONDITION_JURY_VERIFIED, CONDITION_READY, CONDITION_SANDBOXED,
+    build_dedicated_service_account, build_isolated_network_policy, build_scoped_role,
+    build_scoped_role_binding, build_workload_event, canonical_workload_labels,
+    controller_owner_reference, evaluate_workload_admission, has_cleanup_finalizer, is_deleting,
+    upsert_condition, AdmissionContext, AgentWorkload, AgentWorkloadStatus, EventSeverity,
+    ExecutionReceipt, VerdictOutcome, WorkloadCondition, WorkloadEventSpec, WorkloadPhase,
+    CONDITION_ACCEPTED, CONDITION_DISPATCHED, CONDITION_JURY_VERIFIED, CONDITION_READY,
+    CONDITION_SANDBOXED,
 };
 use k8_core::{K8Error, Result};
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::{Event, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 
 /// Snapshot of cluster and BFT jury observations supplied to [`reconcile_workload_pure`].
 #[derive(Debug, Clone, Default)]
@@ -24,6 +29,8 @@ pub struct ReconcileObservation {
     pub jury_receipt: Option<ExecutionReceipt>,
     /// Whether this workload requires a BFT jury quorum receipt before transitioning to `Succeeded`.
     pub require_jury_quorum: bool,
+    /// Optional 7-gate [`AdmissionContext`] evaluated before child resource dispatch (`SPEC-0004`).
+    pub admission_ctx: Option<AdmissionContext>,
     /// Current ISO-8601 controller timestamp used for new condition transitions.
     pub now_iso8601: String,
 }
@@ -33,12 +40,20 @@ pub struct ReconcileObservation {
 pub enum ReconcileEffect {
     /// Patch the `AgentWorkload` metadata to register `agent.unsigned.gg/workload-cleanup`.
     EnsureFinalizer,
+    /// Server-Side Apply the workload's dedicated zero-trust [`ServiceAccount`].
+    ApplyServiceAccount(Box<ServiceAccount>),
+    /// Server-Side Apply the workload's least-privilege [`Role`].
+    ApplyRole(Box<Role>),
+    /// Server-Side Apply the workload's [`RoleBinding`].
+    ApplyRoleBinding(Box<RoleBinding>),
     /// Server-Side Apply the workload's zero-trust [`NetworkPolicy`].
     ApplyNetworkPolicy(Box<NetworkPolicy>),
     /// Server-Side Apply the workload's sandboxed child [`Job`].
     ApplyChildJob(Box<Job>),
     /// Delete the child [`Job`] with foreground cascading propagation.
     DeleteChildJob(String),
+    /// Emit a structured Kubernetes [`Event`] referencing the workload.
+    EmitEvent(Box<Event>),
     /// Server-Side Apply the updated [`AgentWorkloadStatus`] subresource.
     PatchWorkloadStatus(AgentWorkloadStatus),
     /// Remove `agent.unsigned.gg/workload-cleanup` from the `AgentWorkload` metadata.
@@ -56,7 +71,7 @@ pub struct ReconcilePlan {
     pub requeue_after_secs: Option<u64>,
 }
 
-/// Pure, zero-I/O reconciliation state machine for an [`AgentWorkload`] (`SPEC-0002` Invariant 4).
+/// Pure, zero-I/O reconciliation state machine for an [`AgentWorkload`] (`SPEC-0002` & `SPEC-0004`).
 pub fn reconcile_workload_pure(
     workload: &AgentWorkload,
     obs: &ReconcileObservation,
@@ -110,6 +125,63 @@ pub fn reconcile_workload_pure(
         });
     }
 
+    // 2b. Optional 7-gate admission check before dispatching child resources (SPEC-0004)
+    if let Some(adm_ctx) = &obs.admission_ctx {
+        let outcome = evaluate_workload_admission(workload, adm_ctx);
+        if !outcome.allowed {
+            let reason_summary = outcome
+                .violations
+                .iter()
+                .map(|v| format!("[{:?}:{}] {}", v.gate, v.code, v.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let mut status = workload.status.clone().unwrap_or_default();
+            status.phase = WorkloadPhase::Failed;
+            status.completed_at = Some(obs.now_iso8601.clone());
+            status.message = Some(reason_summary.clone());
+            upsert_condition(
+                &mut status.conditions,
+                WorkloadCondition {
+                    type_: CONDITION_ACCEPTED.to_string(),
+                    status: "False".to_string(),
+                    reason: "AdmissionDenied".to_string(),
+                    message: Some(reason_summary.clone()),
+                    last_transition_time: obs.now_iso8601.clone(),
+                },
+            );
+            upsert_condition(
+                &mut status.conditions,
+                WorkloadCondition {
+                    type_: CONDITION_READY.to_string(),
+                    status: "False".to_string(),
+                    reason: "AdmissionDenied".to_string(),
+                    message: None,
+                    last_transition_time: obs.now_iso8601.clone(),
+                },
+            );
+            let mut effects = Vec::new();
+            if let Ok(event) = build_workload_event(
+                workload,
+                &WorkloadEventSpec {
+                    reason: "AdmissionDenied".to_string(),
+                    message: reason_summary,
+                    severity: EventSeverity::Warning,
+                    reporting_controller: "k8-orchestrator".to_string(),
+                    reporting_instance: "k8-orchestrator-0".to_string(),
+                    action: "Admit".to_string(),
+                },
+            ) {
+                effects.push(ReconcileEffect::EmitEvent(Box::new(event)));
+            }
+            effects.push(ReconcileEffect::PatchWorkloadStatus(status));
+            return Ok(ReconcilePlan {
+                next_phase: WorkloadPhase::Failed,
+                effects,
+                requeue_after_secs: None,
+            });
+        }
+    }
+
     // 3. Validate spec & synthesize owner-referenced NetworkPolicy and Job
     let owner_ref = controller_owner_reference(workload).ok();
     let mut netpol = build_isolated_network_policy(
@@ -123,8 +195,12 @@ pub fn reconcile_workload_pure(
         netpol.metadata.owner_references = Some(vec![owner.clone()]);
     }
 
-    let job =
-        Orchestrator::build_validated_job_with_owner(run_id, namespace, &workload.spec, owner_ref)?;
+    let job = Orchestrator::build_validated_job_with_owner(
+        run_id,
+        namespace,
+        &workload.spec,
+        owner_ref.clone(),
+    )?;
 
     let mut status = workload.status.clone().unwrap_or_default();
     status.pod_name = Some(run_id.to_string());
@@ -177,13 +253,33 @@ pub fn reconcile_workload_pure(
             },
         );
 
+        let mut effects = Vec::new();
+        if !workload.spec.rbac_rules.is_empty() {
+            let labels = canonical_workload_labels(run_id, workload.spec.agent_role.as_deref())
+                .map_err(k8_api::SpecValidationError::from)?;
+            let mut sa = build_dedicated_service_account(run_id, namespace, labels.clone(), true)
+                .map_err(k8_api::SpecValidationError::from)?;
+            let mut role =
+                build_scoped_role(run_id, namespace, labels.clone(), &workload.spec.rbac_rules)
+                    .map_err(k8_api::SpecValidationError::from)?;
+            let mut rb = build_scoped_role_binding(run_id, namespace, labels)
+                .map_err(k8_api::SpecValidationError::from)?;
+            if let Some(owner) = &owner_ref {
+                sa.metadata.owner_references = Some(vec![owner.clone()]);
+                role.metadata.owner_references = Some(vec![owner.clone()]);
+                rb.metadata.owner_references = Some(vec![owner.clone()]);
+            }
+            effects.push(ReconcileEffect::ApplyServiceAccount(Box::new(sa)));
+            effects.push(ReconcileEffect::ApplyRole(Box::new(role)));
+            effects.push(ReconcileEffect::ApplyRoleBinding(Box::new(rb)));
+        }
+        effects.push(ReconcileEffect::ApplyNetworkPolicy(Box::new(netpol)));
+        effects.push(ReconcileEffect::ApplyChildJob(Box::new(job)));
+        effects.push(ReconcileEffect::PatchWorkloadStatus(status));
+
         return Ok(ReconcilePlan {
             next_phase: WorkloadPhase::Pending,
-            effects: vec![
-                ReconcileEffect::ApplyNetworkPolicy(Box::new(netpol)),
-                ReconcileEffect::ApplyChildJob(Box::new(job)),
-                ReconcileEffect::PatchWorkloadStatus(status),
-            ],
+            effects,
             requeue_after_secs: Some(5),
         });
     };
@@ -431,6 +527,7 @@ mod tests {
             observed_job: Some(succeeded_job.clone()),
             jury_receipt: Some(receipt),
             require_jury_quorum: true,
+            admission_ctx: None,
             now_iso8601: "2026-10-14T00:05:00Z".to_string(),
         };
         let plan_commit = reconcile_workload_pure(&wl, &obs_commit).expect("reconcile commit");
@@ -469,6 +566,7 @@ mod tests {
             observed_job: Some(succeeded_job),
             jury_receipt: Some(reject_receipt),
             require_jury_quorum: true,
+            admission_ctx: None,
             now_iso8601: "2026-10-14T00:06:00Z".to_string(),
         };
         let plan_reject = reconcile_workload_pure(&wl, &obs_reject).expect("reconcile reject");
@@ -491,5 +589,69 @@ mod tests {
             ReconcileEffect::DeleteChildJob("agent-w1".to_string())
         );
         assert_eq!(plan.effects[2], ReconcileEffect::RemoveFinalizer);
+    }
+
+    #[test]
+    fn test_reconcile_admission_denied_transitions_to_failed_and_emits_warning_event() {
+        let mut wl = base_workload();
+        wl.spec.cpu = Some("16000m".to_string());
+        let obs = ReconcileObservation {
+            admission_ctx: Some(AdmissionContext {
+                quota: Some((
+                    k8_api::NamespaceQuotaSpec {
+                        max_cpu_millis: 4_000,
+                        max_memory_bytes: 8 * 1024 * 1024 * 1024,
+                        max_pods: 4,
+                        warn_threshold_permille: 800,
+                    },
+                    k8_api::QuotaUsageSnapshot::default(),
+                )),
+                required_receipt: None,
+            }),
+            now_iso8601: "2026-10-14T00:12:00Z".to_string(),
+            ..Default::default()
+        };
+
+        let plan = reconcile_workload_pure(&wl, &obs).expect("reconcile admission denied");
+        assert_eq!(plan.next_phase, WorkloadPhase::Failed);
+        assert_eq!(plan.requeue_after_secs, None);
+        assert_eq!(plan.effects.len(), 2);
+        assert!(matches!(plan.effects[0], ReconcileEffect::EmitEvent(_)));
+        assert!(matches!(
+            plan.effects[1],
+            ReconcileEffect::PatchWorkloadStatus(_)
+        ));
+        if let ReconcileEffect::PatchWorkloadStatus(st) = &plan.effects[1] {
+            let acc = find_condition(&st.conditions, CONDITION_ACCEPTED).expect("accepted");
+            assert_eq!(acc.status, "False");
+            assert_eq!(acc.reason, "AdmissionDenied");
+        }
+    }
+
+    #[test]
+    fn test_reconcile_synthesizes_owner_referenced_rbac_when_rules_present() {
+        let mut wl = base_workload();
+        wl.spec.rbac_rules = vec![k8_api::ScopedRuleSpec {
+            api_group: String::new(),
+            resource: "configmaps".to_string(),
+            resource_names: vec!["agent-cfg".to_string()],
+            verbs: vec!["get".to_string()],
+        }];
+        let obs = ReconcileObservation {
+            now_iso8601: "2026-10-14T00:15:00Z".to_string(),
+            ..Default::default()
+        };
+        let plan = reconcile_workload_pure(&wl, &obs).expect("reconcile rbac");
+        assert_eq!(plan.next_phase, WorkloadPhase::Pending);
+        assert_eq!(plan.effects.len(), 6);
+        assert!(matches!(
+            plan.effects[0],
+            ReconcileEffect::ApplyServiceAccount(_)
+        ));
+        assert!(matches!(plan.effects[1], ReconcileEffect::ApplyRole(_)));
+        assert!(matches!(
+            plan.effects[2],
+            ReconcileEffect::ApplyRoleBinding(_)
+        ));
     }
 }

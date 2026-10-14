@@ -4,10 +4,12 @@
 use clap::{Parser, Subcommand};
 use k8_api::{
     audit_network_policy_zero_trust, audit_pod_spec_restricted, audit_pod_volumes,
-    audit_role_least_privilege, audit_service_account_zero_trust, evaluate_workload_admission,
-    from_multi_yaml_manifests, AdmissionContext, AgentWorkload, AgentWorkloadSpec, CpuQuantity,
-    EgressRuleSpec, IsolationProfile, MemoryQuantity, NamespaceQuotaSpec, QuotaUsageSnapshot,
-    ScratchMedium, ScratchVolumeSpec,
+    audit_role_least_privilege, audit_service_account_zero_trust, build_controller_lease,
+    evaluate_cluster_invariants, evaluate_lease_transition, evaluate_workload_admission,
+    from_multi_yaml_manifests, from_yaml_manifest, to_yaml_manifest, AdmissionContext,
+    AgentWorkload, AgentWorkloadSpec, ClusterInvariantReport, ClusterInventorySnapshot,
+    CpuQuantity, EgressRuleSpec, IsolationProfile, MemoryQuantity, NamespaceQuotaSpec,
+    QuotaUsageSnapshot, ScratchMedium, ScratchVolumeSpec, DEFAULT_LEASE_DURATION_SECONDS,
 };
 use k8_core::{K8Client, K8Error, Result};
 use k8_orchestrator::Orchestrator;
@@ -73,6 +75,28 @@ enum Commands {
         /// Namespace active pod ceiling
         #[arg(long, default_value_t = 16)]
         max_pods: u32,
+    },
+
+    /// Audit a ClusterInventorySnapshot YAML 1.2 file against node identity, Kata overhead, and Service endpoint invariants
+    Invariants {
+        /// Path to the ClusterInventorySnapshot YAML 1.2 file
+        #[arg(short, long)]
+        file: PathBuf,
+    },
+
+    /// Render a coordination.k8s.io/v1 leader-election Lease YAML 1.2 manifest
+    Lease {
+        /// Lease metadata.name (DNS-1123 label)
+        #[arg(long, default_value = "k8-orchestrator-leader")]
+        name: String,
+
+        /// Candidate leader holder identity (DNS-1123 label)
+        #[arg(long, default_value = "k8-orchestrator-0")]
+        holder: String,
+
+        /// Lease duration in seconds (1..=3600)
+        #[arg(long, default_value_t = DEFAULT_LEASE_DURATION_SECONDS)]
+        duration_secs: u32,
     },
 
     /// Dispatch a one-shot autonomous agent container Job
@@ -272,6 +296,43 @@ fn admit_yaml_stream(
     Ok(digests)
 }
 
+fn audit_cluster_invariants_yaml(raw_yaml: &str) -> Result<ClusterInvariantReport> {
+    let snapshot: ClusterInventorySnapshot = from_yaml_manifest(raw_yaml)?;
+    let report = evaluate_cluster_invariants(&snapshot);
+    if !report.healthy {
+        let errors = report
+            .findings
+            .iter()
+            .map(|f| {
+                format!(
+                    "[{:?}:{:?}] {}: {}",
+                    f.severity, f.category, f.resource, f.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(K8Error::Config(format!(
+            "Cluster invariant audit failed (digest={}, errors={}, warnings={}): {errors}",
+            report.report_digest, report.error_count, report.warning_count
+        )));
+    }
+    Ok(report)
+}
+
+fn render_lease_yaml(
+    name: &str,
+    namespace: &str,
+    holder: &str,
+    duration_secs: u32,
+) -> Result<String> {
+    let outcome = evaluate_lease_transition(name, namespace, None, holder, 0, duration_secs)
+        .map_err(|e| K8Error::Config(format!("invalid Lease specification: {e}")))?;
+    let lease = build_controller_lease(&outcome.next_state)
+        .map_err(|e| K8Error::Config(format!("failed to synthesize Lease manifest: {e}")))?;
+    let yaml = to_yaml_manifest(&lease)?;
+    Ok(yaml)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -321,6 +382,35 @@ async fn main() -> Result<()> {
                 file.display(),
                 digests.join(", ")
             );
+            return Ok(());
+        }
+
+        Commands::Invariants { file } => {
+            let raw = std::fs::read_to_string(&file).map_err(|e| {
+                K8Error::Config(format!(
+                    "failed to read cluster snapshot {}: {e}",
+                    file.display()
+                ))
+            })?;
+            let report = audit_cluster_invariants_yaml(&raw)?;
+            println!(
+                "Cluster invariants healthy in {} [nodes={}, warnings={}, digest={}]",
+                file.display(),
+                report.node_summaries.len(),
+                report.warning_count,
+                report.report_digest
+            );
+            return Ok(());
+        }
+
+        Commands::Lease {
+            name,
+            holder,
+            duration_secs,
+        } => {
+            let ns = cli.namespace.as_deref().unwrap_or("default");
+            let yaml = render_lease_yaml(&name, ns, &holder, duration_secs)?;
+            print!("{yaml}");
             return Ok(());
         }
 
@@ -453,6 +543,8 @@ async fn main() -> Result<()> {
                 Commands::Crd
                 | Commands::Audit { .. }
                 | Commands::Admit { .. }
+                | Commands::Invariants { .. }
+                | Commands::Lease { .. }
                 | Commands::Run { .. } => {}
             }
         }
@@ -465,7 +557,10 @@ async fn main() -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use k8_api::{to_yaml_manifest, ScopedRuleSpec};
+    use k8_api::{
+        K8sNodeSnapshot, ProviderNodeRecord, ScheduledPodFootprint, ScopedRuleSpec,
+        ServiceEndpointSnapshot,
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     #[test]
@@ -519,5 +614,55 @@ mod tests {
 
         // Exceeding memory quota (1Gi + 256Mi Kata overhead > 1Gi ceiling) must fail admission
         assert!(admit_yaml_stream(&raw, "default", "8000m", "1Gi", 8).is_err());
+    }
+
+    #[test]
+    fn test_invariants_and_lease_cli_helpers() {
+        let snapshot = ClusterInventorySnapshot {
+            provider_nodes: vec![ProviderNodeRecord {
+                provider_id: "hetzner://1001".to_string(),
+                expected_name: "cygnus-worker-01".to_string(),
+                require_kata_runtime: true,
+            }],
+            k8s_nodes: vec![K8sNodeSnapshot {
+                name: "cygnus-worker-01".to_string(),
+                provider_id: Some("hetzner://1001".to_string()),
+                ready: true,
+                unschedulable: false,
+                allocatable_cpu_millis: 8_000,
+                allocatable_memory_bytes: 16 * 1024 * 1024 * 1024,
+                kata_runtime_capable: true,
+            }],
+            scheduled_pods: vec![ScheduledPodFootprint {
+                name: "agent-01".to_string(),
+                namespace: "agent-ns".to_string(),
+                node_name: "cygnus-worker-01".to_string(),
+                cpu_millis: 2_000,
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                isolation_profile: IsolationProfile::KataMicroVm,
+            }],
+            services: vec![ServiceEndpointSnapshot {
+                name: "reverie".to_string(),
+                namespace: "agent-ns".to_string(),
+                service_type: "LoadBalancer".to_string(),
+                ready_endpoints: 2,
+            }],
+            kata_memory_overhead_bytes: None,
+            memory_warn_permille: None,
+        };
+        let raw = to_yaml_manifest(&snapshot).expect("serialize snapshot");
+        let report = audit_cluster_invariants_yaml(&raw).expect("healthy cluster snapshot");
+        assert!(report.healthy);
+        assert_eq!(report.error_count, 0);
+
+        let lease_yaml = render_lease_yaml(
+            "k8-orchestrator-leader",
+            "agent-ns",
+            "k8-orchestrator-0",
+            15,
+        )
+        .expect("render lease");
+        assert!(lease_yaml.contains("k8-orchestrator-leader"));
+        assert!(lease_yaml.contains("k8-orchestrator-0"));
     }
 }

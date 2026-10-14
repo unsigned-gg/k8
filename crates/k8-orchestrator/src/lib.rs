@@ -301,6 +301,36 @@ impl Orchestrator {
                         .apply_namespaced(netpol_name, netpol.as_ref(), true)
                         .await?;
                 }
+                ReconcileEffect::ApplyServiceAccount(sa) => {
+                    let sa_name = sa
+                        .metadata
+                        .name
+                        .as_deref()
+                        .ok_or_else(|| K8Error::Config("ServiceAccount name missing".into()))?;
+                    self.client
+                        .apply_namespaced(sa_name, sa.as_ref(), true)
+                        .await?;
+                }
+                ReconcileEffect::ApplyRole(role) => {
+                    let role_name = role
+                        .metadata
+                        .name
+                        .as_deref()
+                        .ok_or_else(|| K8Error::Config("Role name missing".into()))?;
+                    self.client
+                        .apply_namespaced(role_name, role.as_ref(), true)
+                        .await?;
+                }
+                ReconcileEffect::ApplyRoleBinding(rb) => {
+                    let rb_name = rb
+                        .metadata
+                        .name
+                        .as_deref()
+                        .ok_or_else(|| K8Error::Config("RoleBinding name missing".into()))?;
+                    self.client
+                        .apply_namespaced(rb_name, rb.as_ref(), true)
+                        .await?;
+                }
                 ReconcileEffect::ApplyChildJob(job) => {
                     let job_name = job
                         .metadata
@@ -318,6 +348,16 @@ impl Orchestrator {
                     let mut patched = workload.clone();
                     patched.status = Some(status.clone());
                     self.client.patch_status_namespaced(name, &patched).await?;
+                }
+                ReconcileEffect::EmitEvent(ev) => {
+                    let ev_name = ev
+                        .metadata
+                        .name
+                        .as_deref()
+                        .ok_or_else(|| K8Error::Config("Event name missing".into()))?;
+                    self.client
+                        .apply_namespaced(ev_name, ev.as_ref(), true)
+                        .await?;
                 }
                 ReconcileEffect::RemoveFinalizer => {
                     let mut patched = workload.clone();

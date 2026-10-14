@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check:
+    name: Format, Clippy, Test, Deny & Xtask
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Toolchain & spec checks
+        run: |
+          cargo xtask toolchain-check
+          cargo xtask spec-check
+          cargo xtask graph-audit
+          cargo xtask graph-audit --break-check
+          cargo xtask check --break-check
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings
+
+      - name: Run tests
+        run: |
+          if command -v cargo-nextest >/dev/null 2>&1; then
+            cargo nextest run --workspace --locked -j 2
+          else
+            cargo test --workspace --locked -j 2
+          fi
+
+      - name: Run doc-tests
+        run: cargo test --workspace --doc --locked -j 2
+
+      - name: Cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

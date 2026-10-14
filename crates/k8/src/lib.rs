@@ -5,5 +5,10 @@ pub use k8_api as api;
 pub use k8_core as core;
 pub use k8_orchestrator as orchestrator;
 
+pub use k8_api::{
+    AgentWorkload, AgentWorkloadSpec, AgentWorkloadStatus, CpuQuantity, ExecutionReceipt,
+    JuryQuorum, JuryVote, LabelSelector, MemoryQuantity, ResourceQuotaSpec, ResourceRequest,
+    VerdictOutcome, WorkloadPhase,
+};
 pub use k8_core::{K8Client, K8Error, Result};
 pub use k8_orchestrator::Orchestrator;

@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Repo-local verification gates, DAG runner, and Wave-0 zero-I/O auditor for k8"
+
+[lints]
+workspace = true
+
+[dependencies]

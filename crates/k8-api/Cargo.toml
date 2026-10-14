@@ -2,17 +2,21 @@
 name = "k8-api"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Typed API resources, CRDs, and schemas for k8 agent workloads"
+description = "Wave-0 zero-I/O Kubernetes CRD schemas, resource quantities, YAML manifests, PodSecurity invariants, and BFT jury primitives"
+
+[lints]
+workspace = true
 
 [dependencies]
-k8-core = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-schemars = "1.0"
+serde-saphyr = { workspace = true }
+schemars = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
+thiserror = { workspace = true }

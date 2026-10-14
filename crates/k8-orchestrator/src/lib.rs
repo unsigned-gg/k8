@@ -9,12 +9,14 @@ pub use reconciler::{
 };
 
 use k8_api::{
-    audit_pod_spec_restricted, audit_pod_volumes, build_dedicated_service_account,
-    build_isolated_network_policy, build_scoped_role, build_scoped_role_binding,
-    build_scratch_volume_and_mount, build_workload_pdb, build_workload_tolerations,
-    canonical_workload_labels, ensure_cleanup_finalizer, remove_cleanup_finalizer,
-    restricted_container_security_context, restricted_pod_security_context, to_yaml_manifest,
-    AgentWorkload, AgentWorkloadSpec, ScratchVolumeSpec, WorkloadPhase, LABEL_MANAGED_BY,
+    audit_pod_priority_and_grace_period, audit_pod_spec_restricted, audit_pod_volumes,
+    build_dedicated_service_account, build_isolated_network_policy, build_scoped_role,
+    build_scoped_role_binding, build_scratch_volume_and_mount, build_workload_pdb,
+    build_workload_tolerations, canonical_workload_labels, ensure_cleanup_finalizer,
+    remove_cleanup_finalizer, restricted_container_security_context,
+    restricted_pod_security_context, to_yaml_manifest, AgentWorkload, AgentWorkloadSpec,
+    ScratchVolumeSpec, WorkloadPhase, DEFAULT_TERMINATION_GRACE_SECONDS, LABEL_MANAGED_BY,
+    MAX_TERMINATION_GRACE_SECONDS,
 };
 use k8_core::{delete_foreground_params, list_by_selector, K8Client, K8Error, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
@@ -137,12 +139,19 @@ impl Orchestrator {
             .isolation_profile
             .runtime_class_name()
             .map(str::to_string);
+        let grace_secs = i64::try_from(
+            spec.termination_grace_period_seconds
+                .unwrap_or(DEFAULT_TERMINATION_GRACE_SECONDS),
+        )
+        .unwrap_or(30);
 
         let pod_spec = PodSpec {
             service_account_name: Some(format!("{run_id}-sa")),
             automount_service_account_token: Some(false),
             restart_policy: Some("Never".to_string()),
             runtime_class_name,
+            priority_class_name: Some(spec.priority_tier.class_name().to_string()),
+            termination_grace_period_seconds: Some(grace_secs),
             tolerations: if tolerations.is_empty() {
                 None
             } else {
@@ -156,6 +165,8 @@ impl Orchestrator {
 
         audit_pod_spec_restricted(&pod_spec).map_err(K8Error::SecurityAudit)?;
         audit_pod_volumes(&pod_spec).map_err(k8_api::SpecValidationError::from)?;
+        audit_pod_priority_and_grace_period(&pod_spec, MAX_TERMINATION_GRACE_SECONDS)
+            .map_err(k8_api::SpecValidationError::from)?;
 
         let active_deadline = spec.timeout_seconds.and_then(|s| i64::try_from(s).ok());
 
@@ -473,6 +484,11 @@ mod tests {
             Some("agent-test1234-sa")
         );
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata"));
+        assert_eq!(
+            pod_spec.priority_class_name.as_deref(),
+            Some("k8-interactive-agent")
+        );
+        assert_eq!(pod_spec.termination_grace_period_seconds, Some(30));
         assert_eq!(pod_spec.tolerations.as_ref().map(Vec::len), Some(2));
         assert!(audit_pod_spec_restricted(&pod_spec).is_ok());
 

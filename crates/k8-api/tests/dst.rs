@@ -675,3 +675,249 @@ fn dst_lease_election_backoff_and_cluster_invariants_100_seeds() {
         }
     }
 }
+
+#[test]
+fn dst_node_drain_binpacking_pdb_and_immutable_drift_100_seeds() {
+    use k8_api::{
+        audit_pod_priority_and_grace_period, audit_pvc_mutation, audit_statefulset_immutable_drift,
+        evaluate_node_drain, DrainBlockReason, DrainCandidatePod, DrainClusterContext,
+        DriftRemediationStrategy, IsolationProfile, K8sNodeSnapshot, PdbBudgetSnapshot,
+        PodEvictionAction, ScheduledPodFootprint, WorkloadPriorityTier,
+        DEFAULT_KATA_MEMORY_OVERHEAD_BYTES, MAX_TERMINATION_GRACE_SECONDS,
+    };
+    use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
+    use k8s_openapi::api::core::v1::{
+        PersistentVolumeClaim, PersistentVolumeClaimSpec, VolumeResourceRequirements,
+    };
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    for seed in 0..100_u64 {
+        let mut rng = SplitMix64::new(seed ^ 0x5005_d4a1_9c0d_e004);
+
+        let nodes = vec![
+            K8sNodeSnapshot {
+                name: "cygnus-worker-01".to_string(),
+                provider_id: Some("hetzner://1001".to_string()),
+                ready: true,
+                unschedulable: false,
+                allocatable_cpu_millis: 8_000,
+                allocatable_memory_bytes: 16 * 1024 * 1024 * 1024,
+                kata_runtime_capable: true,
+            },
+            K8sNodeSnapshot {
+                name: "cygnus-worker-02".to_string(),
+                provider_id: Some("hetzner://1002".to_string()),
+                ready: true,
+                unschedulable: false,
+                allocatable_cpu_millis: 8_000,
+                allocatable_memory_bytes: 16 * 1024 * 1024 * 1024,
+                kata_runtime_capable: true,
+            },
+            K8sNodeSnapshot {
+                name: "cygnus-worker-03".to_string(),
+                provider_id: Some("hetzner://1003".to_string()),
+                ready: true,
+                unschedulable: false,
+                allocatable_cpu_millis: 4_000,
+                allocatable_memory_bytes: 8 * 1024 * 1024 * 1024,
+                kata_runtime_capable: false,
+            },
+        ];
+
+        for step in 0..40_u64 {
+            let pod_count = 1 + rng.range(8) as usize;
+            let mut candidate_pods = Vec::with_capacity(pod_count);
+            for i in 0..pod_count {
+                let tier = match rng.range(4) {
+                    0 => WorkloadPriorityTier::SpotScavenger,
+                    1 => WorkloadPriorityTier::BatchResearch,
+                    2 => WorkloadPriorityTier::InteractiveAgent,
+                    _ => WorkloadPriorityTier::EstateCoordinator,
+                };
+                let profile = if rng.range(2) == 0 {
+                    IsolationProfile::KataMicroVm
+                } else {
+                    IsolationProfile::StandardRestricted
+                };
+                let is_daemonset = rng.range(10) == 0;
+                let has_unmanaged_local_storage = !is_daemonset && rng.range(12) == 0;
+                let use_pdb = !is_daemonset && rng.range(3) == 0;
+
+                candidate_pods.push(DrainCandidatePod {
+                    name: format!("pod-{seed}-{step}-{i}"),
+                    namespace: "agent-ns".to_string(),
+                    priority_tier: tier,
+                    isolation_profile: profile,
+                    cpu_millis: 1_000 + rng.range(3) * 1_000,
+                    memory_bytes: (1 + rng.range(3)) * 1024 * 1024 * 1024,
+                    is_daemonset,
+                    is_mirror_pod: false,
+                    has_unmanaged_local_storage,
+                    pdb_name: if use_pdb {
+                        Some("agent-pdb".to_string())
+                    } else {
+                        None
+                    },
+                });
+            }
+
+            let allowed_disruptions = u32::try_from(rng.range(4)).expect("u32");
+            let ctx = DrainClusterContext {
+                target_node: "cygnus-worker-01".to_string(),
+                nodes: nodes.clone(),
+                existing_pods_on_other_nodes: vec![ScheduledPodFootprint {
+                    name: "existing-02".to_string(),
+                    namespace: "agent-ns".to_string(),
+                    node_name: "cygnus-worker-02".to_string(),
+                    cpu_millis: 1_000,
+                    memory_bytes: 1024 * 1024 * 1024,
+                    isolation_profile: IsolationProfile::KataMicroVm,
+                }],
+                drain_candidates: candidate_pods,
+                pdbs: vec![PdbBudgetSnapshot {
+                    name: "agent-pdb".to_string(),
+                    namespace: "agent-ns".to_string(),
+                    disruptions_allowed: allowed_disruptions,
+                }],
+                allow_local_storage_erasure: false,
+                kata_memory_overhead_bytes: Some(DEFAULT_KATA_MEMORY_OVERHEAD_BYTES),
+            };
+
+            let r1 = evaluate_node_drain(&ctx);
+            let r2 = evaluate_node_drain(&ctx);
+            assert_eq!(r1, r2);
+            assert_eq!(r1.safe_to_drain, r1.blocked_count == 0);
+
+            // INV-0005-01: Destination node capacity & Kata capability conservation
+            for dest in &r1.destination_summaries {
+                let node_spec = nodes
+                    .iter()
+                    .find(|n| n.name == dest.node_name)
+                    .expect("destination node exists");
+                assert!(dest.post_drain_cpu_millis <= node_spec.allocatable_cpu_millis);
+                assert!(
+                    dest.post_drain_effective_memory_bytes <= node_spec.allocatable_memory_bytes
+                );
+            }
+
+            // INV-0005-02: PDB disruption budget non-negativity
+            let mut pdb_evictions = 0_u32;
+            for dec in &r1.pod_decisions {
+                if let PodEvictionAction::EvictAndReschedule {
+                    destination_node, ..
+                } = &dec.action
+                {
+                    let src_pod = ctx
+                        .drain_candidates
+                        .iter()
+                        .find(|p| p.name == dec.pod_name)
+                        .expect("candidate pod");
+                    if src_pod.pdb_name.as_deref() == Some("agent-pdb") {
+                        pdb_evictions += 1;
+                    }
+                    if src_pod.isolation_profile == IsolationProfile::KataMicroVm {
+                        let node_spec = nodes
+                            .iter()
+                            .find(|n| &n.name == destination_node)
+                            .expect("dest node");
+                        assert!(node_spec.kata_runtime_capable);
+                    }
+                } else if let PodEvictionAction::Blocked {
+                    reason: DrainBlockReason::UnmanagedLocalStorage,
+                } = &dec.action
+                {
+                    assert!(!r1.safe_to_drain);
+                }
+            }
+            assert!(pdb_evictions <= allowed_disruptions);
+
+            // INV-0005-03: Immutable field drift soundness
+            let live_sts = StatefulSet {
+                metadata: ObjectMeta {
+                    name: Some("reverie-db".to_string()),
+                    ..Default::default()
+                },
+                spec: Some(StatefulSetSpec {
+                    service_name: Some("reverie-headless".to_string()),
+                    volume_claim_templates: Some(vec![PersistentVolumeClaim {
+                        metadata: ObjectMeta {
+                            name: Some("data".to_string()),
+                            ..Default::default()
+                        },
+                        spec: Some(PersistentVolumeClaimSpec {
+                            storage_class_name: Some("hcloud-volumes".to_string()),
+                            resources: Some(VolumeResourceRequirements {
+                                requests: Some(BTreeMap::from([(
+                                    "storage".to_string(),
+                                    Quantity("20Gi".to_string()),
+                                )])),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut mutated_sts = live_sts.clone();
+            mutated_sts
+                .spec
+                .as_mut()
+                .unwrap()
+                .volume_claim_templates
+                .as_mut()
+                .unwrap()[0]
+                .spec
+                .as_mut()
+                .unwrap()
+                .storage_class_name = Some("local-path".to_string());
+            let sts_drift = audit_statefulset_immutable_drift(&live_sts, &mutated_sts);
+            assert_eq!(
+                sts_drift.strategy,
+                DriftRemediationStrategy::RejectedForbiddenMutation
+            );
+
+            let live_pvc = live_sts
+                .spec
+                .as_ref()
+                .unwrap()
+                .volume_claim_templates
+                .as_ref()
+                .unwrap()[0]
+                .clone();
+            let mut shrunk_pvc = live_pvc.clone();
+            shrunk_pvc
+                .spec
+                .as_mut()
+                .unwrap()
+                .resources
+                .as_mut()
+                .unwrap()
+                .requests = Some(BTreeMap::from([(
+                "storage".to_string(),
+                Quantity("10Gi".to_string()),
+            )]));
+            assert_eq!(
+                audit_pvc_mutation(&live_pvc, &shrunk_pvc).strategy,
+                DriftRemediationStrategy::RejectedForbiddenMutation
+            );
+
+            // INV-0005-04: Priority & Termination Grace Containment
+            let bad_grace_pod = PodSpec {
+                priority_class_name: Some("k8-interactive-agent".to_string()),
+                termination_grace_period_seconds: Some(
+                    i64::try_from(MAX_TERMINATION_GRACE_SECONDS + 1 + rng.range(500)).unwrap(),
+                ),
+                ..Default::default()
+            };
+            assert!(audit_pod_priority_and_grace_period(
+                &bad_grace_pod,
+                MAX_TERMINATION_GRACE_SECONDS
+            )
+            .is_err());
+        }
+    }
+}

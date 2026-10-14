@@ -5,11 +5,14 @@
 
 pub mod admission;
 pub mod coordination;
+pub mod drain;
+pub mod drift;
 pub mod invariants;
 pub mod jury;
 pub mod lifecycle;
 pub mod manifest;
 pub mod network;
+pub mod priority;
 pub mod quantity;
 pub mod quota;
 pub mod rbac;
@@ -27,6 +30,15 @@ pub use coordination::{
     evaluate_lease_transition, BackoffPolicy, CoordinationError, EventSeverity, LeaseDecision,
     LeaseStateSnapshot, LeaseTransitionOutcome, WorkloadEventSpec, ANNOTATION_LEASE_ACQUIRE_MS,
     ANNOTATION_LEASE_RENEW_MS, DEFAULT_LEASE_DURATION_SECONDS,
+};
+pub use drain::{
+    build_pod_eviction, evaluate_node_drain, set_node_unschedulable, DrainBlockReason,
+    DrainCandidatePod, DrainClusterContext, DrainPlanReport, NodePlacementSummary,
+    PdbBudgetSnapshot, PodDrainDecision, PodEvictionAction,
+};
+pub use drift::{
+    audit_job_immutable_drift, audit_pvc_mutation, audit_statefulset_immutable_drift, DriftKind,
+    DriftRemediationStrategy, ImmutableDriftReport,
 };
 pub use invariants::{
     evaluate_cluster_invariants, ClusterInvariantFinding, ClusterInvariantReport,
@@ -50,6 +62,11 @@ pub use manifest::{
 pub use network::{
     audit_network_policy_zero_trust, build_isolated_network_policy, validate_non_wildcard_cidr,
     EgressRuleSpec, NetworkPolicyError,
+};
+pub use priority::{
+    audit_pod_priority_and_grace_period, build_estate_priority_classes, build_priority_class,
+    PreemptionBehavior, PriorityError, WorkloadPriorityTier, DEFAULT_TERMINATION_GRACE_SECONDS,
+    FORBIDDEN_SYSTEM_PRIORITY_CLASSES, MAX_TERMINATION_GRACE_SECONDS, MAX_WORKLOAD_PRIORITY_VALUE,
 };
 pub use quantity::{
     CpuQuantity, MemoryQuantity, QuantityError, ResourceQuotaSpec, ResourceRequest, ResourceUsage,
@@ -125,6 +142,10 @@ pub enum SpecValidationError {
     #[error("invalid scratch volume in workload spec: {0}")]
     InvalidStorage(#[from] StorageError),
 
+    /// Priority tier or termination grace period failed validation.
+    #[error("invalid priority or termination grace period in workload spec: {0}")]
+    InvalidPriority(#[from] PriorityError),
+
     /// Timeout is zero or exceeds [`MAX_TIMEOUT_SECONDS`].
     #[error("timeout_seconds ({0}) must be between 1 and {MAX_TIMEOUT_SECONDS}")]
     InvalidTimeout(u64),
@@ -189,6 +210,14 @@ pub struct AgentWorkloadSpec {
     #[serde(default)]
     pub isolation_profile: IsolationProfile,
 
+    /// Workload scheduling priority tier (`estate-coordinator`, `interactive-agent`, `batch-research`, `spot-scavenger`).
+    #[serde(default)]
+    pub priority_tier: WorkloadPriorityTier,
+
+    /// Optional termination grace period in seconds (`1..=300`, defaults to `30`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_grace_period_seconds: Option<u64>,
+
     /// Optional zero-trust outbound network egress rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressRuleSpec>,
@@ -237,6 +266,22 @@ impl AgentWorkloadSpec {
 
         for scratch in &self.scratch_volumes {
             build_scratch_volume_and_mount(scratch)?;
+        }
+
+        if let Some(grace) = self.termination_grace_period_seconds {
+            if grace == 0 {
+                return Err(SpecValidationError::InvalidPriority(
+                    PriorityError::NonPositiveTerminationGracePeriod(0),
+                ));
+            }
+            if grace > MAX_TERMINATION_GRACE_SECONDS {
+                return Err(SpecValidationError::InvalidPriority(
+                    PriorityError::ExcessiveTerminationGracePeriod {
+                        requested: grace,
+                        max: MAX_TERMINATION_GRACE_SECONDS,
+                    },
+                ));
+            }
         }
 
         if let Some(timeout) = self.timeout_seconds {
@@ -376,6 +421,8 @@ mod tests {
             timeout_seconds: Some(3600),
             agent_role: Some("researcher".to_string()),
             isolation_profile: IsolationProfile::KataMicroVm,
+            priority_tier: WorkloadPriorityTier::InteractiveAgent,
+            termination_grace_period_seconds: Some(45),
             egress: Some(EgressRuleSpec {
                 allow_dns: true,
                 allowed_cidrs: vec!["10.42.0.0/16".to_string()],

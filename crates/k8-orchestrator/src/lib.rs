@@ -9,11 +9,12 @@ pub use reconciler::{
 };
 
 use k8_api::{
-    audit_pod_spec_restricted, build_isolated_network_policy, build_workload_pdb,
-    build_workload_tolerations, canonical_workload_labels, ensure_cleanup_finalizer,
-    remove_cleanup_finalizer, restricted_container_security_context,
-    restricted_pod_security_context, to_yaml_manifest, AgentWorkload, AgentWorkloadSpec,
-    WorkloadPhase, LABEL_MANAGED_BY,
+    audit_pod_spec_restricted, audit_pod_volumes, build_dedicated_service_account,
+    build_isolated_network_policy, build_scoped_role, build_scoped_role_binding,
+    build_scratch_volume_and_mount, build_workload_pdb, build_workload_tolerations,
+    canonical_workload_labels, ensure_cleanup_finalizer, remove_cleanup_finalizer,
+    restricted_container_security_context, restricted_pod_security_context, to_yaml_manifest,
+    AgentWorkload, AgentWorkloadSpec, ScratchVolumeSpec, WorkloadPhase, LABEL_MANAGED_BY,
 };
 use k8_core::{delete_foreground_params, list_by_selector, K8Client, K8Error, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
@@ -59,7 +60,8 @@ impl Orchestrator {
     }
 
     /// Validate `spec` and construct a PodSecurity `restricted` Kubernetes [`Job`] with an optional
-    /// controller [`OwnerReference`], Kata microVM `runtimeClassName`, and node taint tolerations.
+    /// controller [`OwnerReference`], Kata microVM `runtimeClassName`, node taint tolerations,
+    /// dedicated `ServiceAccount`, and bounded ephemeral scratch volumes.
     pub fn build_validated_job_with_owner(
         run_id: &str,
         namespace: &str,
@@ -87,6 +89,21 @@ impl Orchestrator {
             limits.insert("nvidia.com/gpu".to_string(), Quantity(req.gpu.to_string()));
         }
 
+        let scratch_specs: Vec<ScratchVolumeSpec> = if spec.scratch_volumes.is_empty() {
+            vec![ScratchVolumeSpec::default()]
+        } else {
+            spec.scratch_volumes.clone()
+        };
+
+        let mut volumes = Vec::with_capacity(scratch_specs.len());
+        let mut volume_mounts = Vec::with_capacity(scratch_specs.len());
+        for scratch in &scratch_specs {
+            let (vol, mount) = build_scratch_volume_and_mount(scratch)
+                .map_err(k8_api::SpecValidationError::from)?;
+            volumes.push(vol);
+            volume_mounts.push(mount);
+        }
+
         let container = Container {
             name: "agent".to_string(),
             image: Some(spec.image.clone()),
@@ -110,6 +127,7 @@ impl Orchestrator {
                 requests: Some(limits),
                 ..Default::default()
             }),
+            volume_mounts: Some(volume_mounts),
             security_context: Some(restricted_container_security_context()),
             ..Default::default()
         };
@@ -121,6 +139,7 @@ impl Orchestrator {
             .map(str::to_string);
 
         let pod_spec = PodSpec {
+            service_account_name: Some(format!("{run_id}-sa")),
             automount_service_account_token: Some(false),
             restart_policy: Some("Never".to_string()),
             runtime_class_name,
@@ -129,12 +148,14 @@ impl Orchestrator {
             } else {
                 Some(tolerations)
             },
+            volumes: Some(volumes),
             containers: vec![container],
             security_context: Some(restricted_pod_security_context()),
             ..Default::default()
         };
 
         audit_pod_spec_restricted(&pod_spec).map_err(K8Error::SecurityAudit)?;
+        audit_pod_volumes(&pod_spec).map_err(k8_api::SpecValidationError::from)?;
 
         let active_deadline = spec.timeout_seconds.and_then(|s| i64::try_from(s).ok());
 
@@ -183,13 +204,18 @@ impl Orchestrator {
     }
 
     /// Validate `spec` and render a full zero-trust Kubernetes YAML 1.2 bundle containing
-    /// `NetworkPolicy`, `PodDisruptionBudget`, and `Job` separated by `---`.
+    /// `ServiceAccount` (+ optional `Role` and `RoleBinding`), `NetworkPolicy`,
+    /// `PodDisruptionBudget`, and `Job` separated by `---`.
     pub fn render_workload_bundle_yaml(
         run_id: &str,
         namespace: &str,
         spec: &AgentWorkloadSpec,
     ) -> Result<String> {
         let job = Self::build_validated_job(run_id, namespace, spec)?;
+        let labels = canonical_workload_labels(run_id, spec.agent_role.as_deref())
+            .map_err(k8_api::SpecValidationError::from)?;
+        let sa = build_dedicated_service_account(run_id, namespace, labels.clone(), false)
+            .map_err(k8_api::SpecValidationError::from)?;
         let netpol = build_isolated_network_policy(
             run_id,
             namespace,
@@ -200,16 +226,21 @@ impl Orchestrator {
         let pdb = build_workload_pdb(run_id, namespace, spec.agent_role.as_deref(), 1)
             .map_err(k8_api::SpecValidationError::from)?;
 
-        let netpol_yaml = to_yaml_manifest(&netpol)?;
-        let pdb_yaml = to_yaml_manifest(&pdb)?;
-        let job_yaml = to_yaml_manifest(&job)?;
+        let mut docs = Vec::with_capacity(6);
+        docs.push(to_yaml_manifest(&sa)?.trim_end().to_owned());
+        if !spec.rbac_rules.is_empty() {
+            let role = build_scoped_role(run_id, namespace, labels.clone(), &spec.rbac_rules)
+                .map_err(k8_api::SpecValidationError::from)?;
+            let rb = build_scoped_role_binding(run_id, namespace, labels)
+                .map_err(k8_api::SpecValidationError::from)?;
+            docs.push(to_yaml_manifest(&role)?.trim_end().to_owned());
+            docs.push(to_yaml_manifest(&rb)?.trim_end().to_owned());
+        }
+        docs.push(to_yaml_manifest(&netpol)?.trim_end().to_owned());
+        docs.push(to_yaml_manifest(&pdb)?.trim_end().to_owned());
+        docs.push(to_yaml_manifest(&job)?);
 
-        Ok(format!(
-            "{}\n---\n{}\n---\n{}",
-            netpol_yaml.trim_end(),
-            pdb_yaml.trim_end(),
-            job_yaml
-        ))
+        Ok(docs.join("\n---\n"))
     }
 
     /// Deterministically evaluate the [`WorkloadPhase`] of a Kubernetes [`Job`].
@@ -364,6 +395,7 @@ mod tests {
                 allowed_cidrs: vec!["10.42.0.0/16".to_string()],
                 allowed_tcp_ports: vec![443],
             }),
+            ..Default::default()
         };
 
         let job = Orchestrator::build_validated_job("agent-test1234", "agent-ns", &spec)
@@ -396,6 +428,10 @@ mod tests {
 
         let pod_spec = job_spec.template.spec.expect("pod spec present");
         assert_eq!(pod_spec.automount_service_account_token, Some(false));
+        assert_eq!(
+            pod_spec.service_account_name.as_deref(),
+            Some("agent-test1234-sa")
+        );
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata"));
         assert_eq!(pod_spec.tolerations.as_ref().map(Vec::len), Some(2));
         assert!(audit_pod_spec_restricted(&pod_spec).is_ok());
@@ -409,10 +445,11 @@ mod tests {
             .expect("render bundle yaml");
         let headers: Vec<ManifestHeader> =
             from_multi_yaml_manifests(&bundle).expect("parse multi-doc bundle");
-        assert_eq!(headers.len(), 3);
-        assert_eq!(headers[0].kind, "NetworkPolicy");
-        assert_eq!(headers[1].kind, "PodDisruptionBudget");
-        assert_eq!(headers[2].kind, "Job");
+        assert_eq!(headers.len(), 4);
+        assert_eq!(headers[0].kind, "ServiceAccount");
+        assert_eq!(headers[1].kind, "NetworkPolicy");
+        assert_eq!(headers[2].kind, "PodDisruptionBudget");
+        assert_eq!(headers[3].kind, "Job");
     }
 
     #[test]

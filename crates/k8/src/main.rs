@@ -3,14 +3,18 @@
 
 use clap::{Parser, Subcommand};
 use k8_api::{
-    audit_network_policy_zero_trust, audit_pod_spec_restricted, from_multi_yaml_manifests,
-    AgentWorkload, AgentWorkloadSpec, EgressRuleSpec, IsolationProfile,
+    audit_network_policy_zero_trust, audit_pod_spec_restricted, audit_pod_volumes,
+    audit_role_least_privilege, audit_service_account_zero_trust, evaluate_workload_admission,
+    from_multi_yaml_manifests, AdmissionContext, AgentWorkload, AgentWorkloadSpec, CpuQuantity,
+    EgressRuleSpec, IsolationProfile, MemoryQuantity, NamespaceQuotaSpec, QuotaUsageSnapshot,
+    ScratchMedium, ScratchVolumeSpec,
 };
 use k8_core::{K8Client, K8Error, Result};
 use k8_orchestrator::Orchestrator;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::rbac::v1::Role;
 use kube::api::{Api, ListParams};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -45,11 +49,30 @@ enum Commands {
     /// Render the AgentWorkload CustomResourceDefinition (CRD) YAML 1.2 manifest
     Crd,
 
-    /// Audit a single or multi-document YAML 1.2 manifest against PodSecurity `restricted` and zero-trust invariants
+    /// Audit a single or multi-document YAML 1.2 manifest against PodSecurity `restricted`, RBAC, volume, and network invariants
     Audit {
         /// Path to the YAML 1.2 manifest file
         #[arg(short, long)]
         file: PathBuf,
+    },
+
+    /// Evaluate the pure multi-gate ValidatingAdmissionPolicy engine against an AgentWorkload manifest
+    Admit {
+        /// Path to the AgentWorkload YAML 1.2 manifest file
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Namespace CPU quota ceiling (e.g. 16000m or 16)
+        #[arg(long, default_value = "16000m")]
+        max_cpu: String,
+
+        /// Namespace memory quota ceiling (e.g. 32Gi)
+        #[arg(long, default_value = "32Gi")]
+        max_memory: String,
+
+        /// Namespace active pod ceiling
+        #[arg(long, default_value_t = 16)]
+        max_pods: u32,
     },
 
     /// Dispatch a one-shot autonomous agent container Job
@@ -97,7 +120,11 @@ enum Commands {
         #[arg(long = "allow-port")]
         allow_ports: Vec<u16>,
 
-        /// Render the full YAML 1.2 bundle (NetworkPolicy + PodDisruptionBudget + Job) in dry-run mode
+        /// Attach a bounded tmpfs `/tmp` scratch volume with the specified size limit (e.g. 64Mi)
+        #[arg(long = "scratch-tmp")]
+        scratch_tmp: Option<String>,
+
+        /// Render the full YAML 1.2 bundle (ServiceAccount + NetworkPolicy + PodDisruptionBudget + Job) in dry-run mode
         #[arg(long)]
         bundle: bool,
 
@@ -147,6 +174,9 @@ fn audit_yaml_stream(raw_yaml: &str) -> Result<usize> {
                     .and_then(|s| s.template.spec.as_ref())
                     .ok_or_else(|| K8Error::Config("Job missing spec.template.spec".into()))?;
                 audit_pod_spec_restricted(pod_spec).map_err(K8Error::SecurityAudit)?;
+                audit_pod_volumes(pod_spec).map_err(|e| {
+                    K8Error::Config(format!("Job volume security audit failed: {e}"))
+                })?;
             }
             "Pod" => {
                 let pod: Pod = serde_json::from_value(doc.clone())
@@ -156,6 +186,24 @@ fn audit_yaml_stream(raw_yaml: &str) -> Result<usize> {
                     .as_ref()
                     .ok_or_else(|| K8Error::Config("Pod missing spec".into()))?;
                 audit_pod_spec_restricted(pod_spec).map_err(K8Error::SecurityAudit)?;
+                audit_pod_volumes(pod_spec).map_err(|e| {
+                    K8Error::Config(format!("Pod volume security audit failed: {e}"))
+                })?;
+            }
+            "ServiceAccount" => {
+                let sa: ServiceAccount = serde_json::from_value(doc.clone()).map_err(|e| {
+                    K8Error::Config(format!("invalid ServiceAccount document: {e}"))
+                })?;
+                audit_service_account_zero_trust(&sa).map_err(|e| {
+                    K8Error::Config(format!("ServiceAccount zero-trust audit failed: {e}"))
+                })?;
+            }
+            "Role" => {
+                let role: Role = serde_json::from_value(doc.clone())
+                    .map_err(|e| K8Error::Config(format!("invalid Role document: {e}")))?;
+                audit_role_least_privilege(&role).map_err(|e| {
+                    K8Error::Config(format!("Role least-privilege audit failed: {e}"))
+                })?;
             }
             "NetworkPolicy" => {
                 let np: NetworkPolicy = serde_json::from_value(doc.clone())
@@ -171,6 +219,57 @@ fn audit_yaml_stream(raw_yaml: &str) -> Result<usize> {
         }
     }
     Ok(docs.len())
+}
+
+fn admit_yaml_stream(
+    raw_yaml: &str,
+    namespace: &str,
+    max_cpu: &str,
+    max_memory: &str,
+    max_pods: u32,
+) -> Result<Vec<String>> {
+    let cpu_qty = max_cpu
+        .parse::<CpuQuantity>()
+        .map_err(k8_api::SpecValidationError::from)?;
+    let mem_qty = max_memory
+        .parse::<MemoryQuantity>()
+        .map_err(k8_api::SpecValidationError::from)?;
+    let ctx = AdmissionContext {
+        quota: Some((
+            NamespaceQuotaSpec {
+                max_cpu_millis: cpu_qty.millicores(),
+                max_memory_bytes: mem_qty.bytes(),
+                max_pods,
+                warn_threshold_permille: k8_api::DEFAULT_QUOTA_WARN_PERMILLE,
+            },
+            QuotaUsageSnapshot::default(),
+        )),
+        required_receipt: None,
+    };
+
+    let workloads: Vec<AgentWorkload> = from_multi_yaml_manifests(raw_yaml)?;
+    let mut digests = Vec::with_capacity(workloads.len());
+    for wl in &workloads {
+        let mut evaluated = wl.clone();
+        if evaluated.metadata.namespace.is_none() {
+            evaluated.metadata.namespace = Some(namespace.to_string());
+        }
+        let outcome = evaluate_workload_admission(&evaluated, &ctx);
+        if !outcome.allowed {
+            let formatted = outcome
+                .violations
+                .iter()
+                .map(|v| format!("[{:?}:{}] {}", v.gate, v.code, v.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(K8Error::Config(format!(
+                "Admission denied for {} (digest={}): {formatted}",
+                outcome.workload_name, outcome.decision_digest
+            )));
+        }
+        digests.push(outcome.decision_digest);
+    }
+    Ok(digests)
 }
 
 #[tokio::main]
@@ -199,8 +298,28 @@ async fn main() -> Result<()> {
             })?;
             let count = audit_yaml_stream(&raw)?;
             println!(
-                "Verified {count} YAML 1.2 document(s) in {} against PodSecurity restricted and zero-trust invariants",
+                "Verified {count} YAML 1.2 document(s) in {} against PodSecurity restricted, RBAC, volume, and zero-trust invariants",
                 file.display()
+            );
+            return Ok(());
+        }
+
+        Commands::Admit {
+            file,
+            max_cpu,
+            max_memory,
+            max_pods,
+        } => {
+            let raw = std::fs::read_to_string(&file).map_err(|e| {
+                K8Error::Config(format!("failed to read manifest {}: {e}", file.display()))
+            })?;
+            let ns = cli.namespace.as_deref().unwrap_or("default");
+            let digests = admit_yaml_stream(&raw, ns, &max_cpu, &max_memory, max_pods)?;
+            println!(
+                "Admitted {} AgentWorkload(s) in {} [digests: {}]",
+                digests.len(),
+                file.display(),
+                digests.join(", ")
             );
             return Ok(());
         }
@@ -217,6 +336,7 @@ async fn main() -> Result<()> {
             kata,
             allow_cidrs,
             allow_ports,
+            scratch_tmp,
             bundle,
             dry_run,
         } => {
@@ -228,6 +348,16 @@ async fn main() -> Result<()> {
                     allowed_cidrs: allow_cidrs,
                     allowed_tcp_ports: allow_ports,
                 })
+            };
+
+            let scratch_volumes = match scratch_tmp {
+                Some(limit) => vec![ScratchVolumeSpec {
+                    name: "scratch-tmp".to_string(),
+                    mount_path: "/tmp".to_string(),
+                    size_limit: limit,
+                    medium: ScratchMedium::Memory,
+                }],
+                None => Vec::new(),
             };
 
             let spec = AgentWorkloadSpec {
@@ -246,6 +376,8 @@ async fn main() -> Result<()> {
                     IsolationProfile::StandardRestricted
                 },
                 egress,
+                scratch_volumes,
+                rbac_rules: Vec::new(),
             };
 
             if dry_run {
@@ -318,7 +450,10 @@ async fn main() -> Result<()> {
                     println!("Received shutdown signal. Exiting k8 daemon.");
                 }
 
-                Commands::Crd | Commands::Audit { .. } | Commands::Run { .. } => {}
+                Commands::Crd
+                | Commands::Audit { .. }
+                | Commands::Admit { .. }
+                | Commands::Run { .. } => {}
             }
         }
     }
@@ -330,9 +465,11 @@ async fn main() -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use k8_api::{to_yaml_manifest, ScopedRuleSpec};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     #[test]
-    fn test_audit_yaml_stream_accepts_hardened_bundle() {
+    fn test_audit_yaml_stream_accepts_hardened_bundle_with_rbac_and_scratch() {
         let spec = AgentWorkloadSpec {
             image: "ghcr.io/unsigned-gg/agent:latest".to_string(),
             isolation_profile: IsolationProfile::KataMicroVm,
@@ -341,11 +478,46 @@ mod tests {
                 allowed_cidrs: vec!["10.42.0.0/16".to_string()],
                 allowed_tcp_ports: vec![443],
             }),
+            scratch_volumes: vec![ScratchVolumeSpec::default()],
+            rbac_rules: vec![ScopedRuleSpec {
+                api_group: String::new(),
+                resource: "configmaps".to_string(),
+                resource_names: vec!["agent-cfg".to_string()],
+                verbs: vec!["get".to_string()],
+            }],
             ..Default::default()
         };
         let bundle = Orchestrator::render_workload_bundle_yaml("agent-bundle1", "default", &spec)
             .expect("render bundle");
         let count = audit_yaml_stream(&bundle).expect("audit bundle");
-        assert_eq!(count, 3);
+        assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn test_admit_yaml_stream_evaluates_multi_gate_engine() {
+        let wl = AgentWorkload {
+            metadata: ObjectMeta {
+                name: Some("agent-admit1".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: AgentWorkloadSpec {
+                image: "ghcr.io/unsigned-gg/agent:latest".to_string(),
+                cpu: Some("1000m".to_string()),
+                memory: Some("1Gi".to_string()),
+                isolation_profile: IsolationProfile::KataMicroVm,
+                scratch_volumes: vec![ScratchVolumeSpec::default()],
+                ..Default::default()
+            },
+            status: None,
+        };
+        let raw = to_yaml_manifest(&wl).expect("serialize workload");
+        let digests =
+            admit_yaml_stream(&raw, "default", "8000m", "8Gi", 8).expect("admit valid workload");
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests[0].len(), 16);
+
+        // Exceeding memory quota (1Gi + 256Mi Kata overhead > 1Gi ceiling) must fail admission
+        assert!(admit_yaml_stream(&raw, "default", "8000m", "1Gi", 8).is_err());
     }
 }

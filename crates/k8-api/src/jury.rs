@@ -129,6 +129,18 @@ impl ExecutionReceipt {
         }
         format!("{hash:016x}")
     }
+
+    /// Verify that `self.receipt_commitment` matches the canonical commitment over the receipt fields.
+    #[must_use]
+    pub fn verify_commitment(&self) -> bool {
+        Self::compute_commitment(
+            &self.workload_id,
+            self.round,
+            self.outcome,
+            &self.artifact_digest,
+            &self.signers,
+        ) == self.receipt_commitment
+    }
 }
 
 /// Deterministic $3f + 1$ Byzantine fault-tolerant jury quorum state machine.

@@ -4,6 +4,8 @@
 //! zero-trust `NetworkPolicy` builders, scheduling primitives, and `3f + 1` BFT jury quorums.
 
 pub mod admission;
+pub mod coordination;
+pub mod invariants;
 pub mod jury;
 pub mod lifecycle;
 pub mod manifest;
@@ -19,6 +21,17 @@ pub mod storage;
 pub use admission::{
     evaluate_workload_admission, AdmissionContext, AdmissionGate, AdmissionReviewOutcome,
     AdmissionViolation,
+};
+pub use coordination::{
+    build_controller_lease, build_workload_event, compute_requeue_delay_ms,
+    evaluate_lease_transition, BackoffPolicy, CoordinationError, EventSeverity, LeaseDecision,
+    LeaseStateSnapshot, LeaseTransitionOutcome, WorkloadEventSpec, ANNOTATION_LEASE_ACQUIRE_MS,
+    ANNOTATION_LEASE_RENEW_MS, DEFAULT_LEASE_DURATION_SECONDS,
+};
+pub use invariants::{
+    evaluate_cluster_invariants, ClusterInvariantFinding, ClusterInvariantReport,
+    ClusterInventorySnapshot, InvariantCategory, InvariantSeverity, K8sNodeSnapshot,
+    NodeHeadroomSummary, ProviderNodeRecord, ScheduledPodFootprint, ServiceEndpointSnapshot,
 };
 pub use jury::{
     EquivocationFault, ExecutionReceipt, JuryError, JuryQuorum, JuryVote, VerdictOutcome,

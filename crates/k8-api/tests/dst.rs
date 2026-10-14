@@ -482,3 +482,196 @@ fn dst_rbac_quota_storage_and_admission_100_seeds() {
         }
     }
 }
+
+#[test]
+fn dst_lease_election_backoff_and_cluster_invariants_100_seeds() {
+    use k8_api::{
+        build_controller_lease, compute_requeue_delay_ms, evaluate_cluster_invariants,
+        evaluate_lease_transition, BackoffPolicy, ClusterInventorySnapshot, IsolationProfile,
+        K8sNodeSnapshot, LeaseDecision, LeaseStateSnapshot, ProviderNodeRecord,
+        ScheduledPodFootprint, ServiceEndpointSnapshot, DEFAULT_KATA_MEMORY_OVERHEAD_BYTES,
+    };
+
+    let replicas = ["controller-0", "controller-1", "controller-2"];
+    let policy = BackoffPolicy {
+        base_delay_ms: 500,
+        max_delay_ms: 60_000,
+        max_exponent: 8,
+        jitter_permille: 200,
+    };
+
+    for seed in 0..100_u64 {
+        let mut rng = SplitMix64::new(seed ^ 0xCAFE_BABE_DEAD_BEEF);
+        let mut now_ms: u64 = 1_700_000_000_000;
+        let mut lease_state: Option<LeaseStateSnapshot> = None;
+        let mut scheduled_pods: Vec<ScheduledPodFootprint> = Vec::new();
+
+        for step in 0..160_u64 {
+            // Advance virtual monotonic clock by 1s..=8s
+            now_ms = now_ms.saturating_add(1_000 + rng.range(7_001));
+
+            // Pick a starting replica permutation and let all 3 replicas attempt transition at `now_ms`
+            let start_idx = rng.range(3) as usize;
+            let mut leaders_at_tick = Vec::new();
+            let prev_transitions = lease_state.as_ref().map_or(0, |s| s.lease_transitions);
+            let prev_holder = lease_state.as_ref().and_then(|s| s.holder_identity.clone());
+
+            for offset in 0..3_usize {
+                let candidate = replicas[(start_idx + offset) % 3];
+                let outcome = evaluate_lease_transition(
+                    "k8-orchestrator-leader",
+                    "agent-ns",
+                    lease_state.as_ref(),
+                    candidate,
+                    now_ms,
+                    15,
+                )
+                .expect("valid lease evaluation");
+
+                // Update shared lease state when a transition mutates the lease
+                if outcome.is_leader {
+                    if let Some(prev) = &prev_holder {
+                        if prev == candidate {
+                            assert_eq!(outcome.decision, LeaseDecision::Renew);
+                        }
+                    }
+                    lease_state = Some(outcome.next_state.clone());
+                    let lease_obj =
+                        build_controller_lease(&outcome.next_state).expect("build lease");
+                    assert_eq!(
+                        lease_obj
+                            .spec
+                            .as_ref()
+                            .and_then(|s| s.holder_identity.as_deref()),
+                        Some(candidate)
+                    );
+                } else {
+                    assert!(matches!(outcome.decision, LeaseDecision::Standby { .. }));
+                }
+            }
+
+            // Re-verify INV-0004-02: probing all 3 replicas at the exact same `now_ms` against the
+            // settled state grants leadership (`is_leader == true`) to at most 1 replica.
+            for &candidate in &replicas {
+                let check = evaluate_lease_transition(
+                    "k8-orchestrator-leader",
+                    "agent-ns",
+                    lease_state.as_ref(),
+                    candidate,
+                    now_ms,
+                    15,
+                )
+                .expect("probe lease");
+                if check.is_leader {
+                    leaders_at_tick.push(candidate);
+                }
+            }
+            assert_eq!(
+                leaders_at_tick.len(),
+                1,
+                "INV-0004-02 violated: exactly one leader must hold the lease at now_ms={now_ms}"
+            );
+            let current_transitions = lease_state.as_ref().map_or(0, |s| s.lease_transitions);
+            assert!(current_transitions >= prev_transitions);
+
+            // Exercise deterministic exponential backoff
+            let failure_count = rng.range(16) as u32;
+            let d1 = compute_requeue_delay_ms(&policy, failure_count, seed ^ step);
+            let d2 = compute_requeue_delay_ms(&policy, failure_count, seed ^ step);
+            assert_eq!(d1, d2);
+            assert!((policy.base_delay_ms..=policy.max_delay_ms).contains(&d1));
+
+            // Mutate scheduled pods and audit cluster invariants
+            if rng.range(2) == 0 && scheduled_pods.len() < 6 {
+                let node_name = if rng.range(2) == 0 {
+                    "cygnus-worker-01".to_string()
+                } else {
+                    "cygnus-worker-02".to_string()
+                };
+                let profile = if rng.range(2) == 0 {
+                    IsolationProfile::KataMicroVm
+                } else {
+                    IsolationProfile::StandardRestricted
+                };
+                scheduled_pods.push(ScheduledPodFootprint {
+                    name: format!("pod-{seed}-{step}"),
+                    namespace: "agent-ns".to_string(),
+                    node_name,
+                    cpu_millis: 1_000,
+                    memory_bytes: 1024 * 1024 * 1024,
+                    isolation_profile: profile,
+                });
+            } else if !scheduled_pods.is_empty() {
+                let idx = rng.range(scheduled_pods.len() as u64) as usize;
+                scheduled_pods.swap_remove(idx);
+            }
+
+            let snapshot = ClusterInventorySnapshot {
+                provider_nodes: vec![
+                    ProviderNodeRecord {
+                        provider_id: "hetzner://1001".to_string(),
+                        expected_name: "cygnus-worker-01".to_string(),
+                        require_kata_runtime: true,
+                    },
+                    ProviderNodeRecord {
+                        provider_id: "hetzner://1002".to_string(),
+                        expected_name: "cygnus-worker-02".to_string(),
+                        require_kata_runtime: true,
+                    },
+                ],
+                k8s_nodes: vec![
+                    K8sNodeSnapshot {
+                        name: "cygnus-worker-01".to_string(),
+                        provider_id: Some("hetzner://1001".to_string()),
+                        ready: true,
+                        unschedulable: false,
+                        allocatable_cpu_millis: 8_000,
+                        allocatable_memory_bytes: 16 * 1024 * 1024 * 1024,
+                        kata_runtime_capable: true,
+                    },
+                    K8sNodeSnapshot {
+                        name: "cygnus-worker-02".to_string(),
+                        provider_id: Some("hetzner://1002".to_string()),
+                        ready: true,
+                        unschedulable: false,
+                        allocatable_cpu_millis: 8_000,
+                        allocatable_memory_bytes: 16 * 1024 * 1024 * 1024,
+                        kata_runtime_capable: true,
+                    },
+                ],
+                scheduled_pods: scheduled_pods.clone(),
+                services: vec![ServiceEndpointSnapshot {
+                    name: "reverie".to_string(),
+                    namespace: "agent-ns".to_string(),
+                    service_type: "LoadBalancer".to_string(),
+                    ready_endpoints: 2,
+                }],
+                kata_memory_overhead_bytes: None,
+                memory_warn_permille: None,
+            };
+
+            let r1 = evaluate_cluster_invariants(&snapshot);
+            let r2 = evaluate_cluster_invariants(&snapshot);
+            // INV-0004-04: Deterministic report digest
+            assert_eq!(r1, r2);
+            assert!(r1.healthy);
+
+            // INV-0004-03: Node Kata Memory Conservation
+            for summary in &r1.node_summaries {
+                let node_pods: Vec<_> = scheduled_pods
+                    .iter()
+                    .filter(|p| p.node_name == summary.node_name)
+                    .collect();
+                let expected_container_mem: u64 = node_pods.iter().map(|p| p.memory_bytes).sum();
+                let expected_kata_count = node_pods
+                    .iter()
+                    .filter(|p| p.isolation_profile == IsolationProfile::KataMicroVm)
+                    .count() as u32;
+                let expected_effective = expected_container_mem
+                    + u64::from(expected_kata_count) * DEFAULT_KATA_MEMORY_OVERHEAD_BYTES;
+                assert_eq!(summary.kata_pod_count, expected_kata_count);
+                assert_eq!(summary.effective_memory_bytes, expected_effective);
+            }
+        }
+    }
+}

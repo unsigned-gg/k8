@@ -27,7 +27,7 @@ use crate::selector::{canonical_workload_labels, validate_dns1123_label};
 use crate::storage::{build_scratch_volume_and_mount, ScratchVolumeSpec};
 use crate::{AgentWorkload, SpecValidationError};
 
-/// Policy gate identifier in the admission pipeline (`SPEC-0003`).
+/// Policy gate identifier in the admission pipeline (`SPEC-0003` & `SPEC-0005`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum AdmissionGate {
     /// Workload metadata, DNS-1123 naming, and core spec fields.
@@ -40,6 +40,8 @@ pub enum AdmissionGate {
     LeastPrivilegeRbac,
     /// Bounded ephemeral scratch volumes and mount path hygiene.
     VolumeHygiene,
+    /// PriorityClass tier and bounded termination grace period (`SPEC-0005`).
+    PriorityAndGracePeriod,
     /// Namespace `ResourceQuota` headroom (including Kata MicroVM overhead).
     NamespaceQuota,
     /// BFT jury execution receipt verification.
@@ -128,6 +130,7 @@ pub fn evaluate_workload_admission(
             SpecValidationError::InvalidNetworkPolicy(_) => AdmissionGate::ZeroTrustNetwork,
             SpecValidationError::InvalidRbac(_) => AdmissionGate::LeastPrivilegeRbac,
             SpecValidationError::InvalidStorage(_) => AdmissionGate::VolumeHygiene,
+            SpecValidationError::InvalidPriority(_) => AdmissionGate::PriorityAndGracePeriod,
             SpecValidationError::InvalidImage(_)
             | SpecValidationError::InvalidLabel(_)
             | SpecValidationError::InvalidTimeout(_)
@@ -328,6 +331,8 @@ mod tests {
                 timeout_seconds: Some(600),
                 agent_role: Some("researcher".to_owned()),
                 isolation_profile: IsolationProfile::KataMicroVm,
+                priority_tier: crate::priority::WorkloadPriorityTier::InteractiveAgent,
+                termination_grace_period_seconds: Some(30),
                 egress: Some(EgressRuleSpec {
                     allow_dns: true,
                     allowed_cidrs: vec!["10.96.0.0/12".to_owned()],

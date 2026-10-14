@@ -3,18 +3,23 @@
 
 use clap::{Parser, Subcommand};
 use k8_api::{
-    audit_network_policy_zero_trust, audit_pod_spec_restricted, audit_pod_volumes,
-    audit_role_least_privilege, audit_service_account_zero_trust, build_controller_lease,
-    evaluate_cluster_invariants, evaluate_lease_transition, evaluate_workload_admission,
+    audit_job_immutable_drift, audit_network_policy_zero_trust,
+    audit_pod_priority_and_grace_period, audit_pod_spec_restricted, audit_pod_volumes,
+    audit_pvc_mutation, audit_role_least_privilege, audit_service_account_zero_trust,
+    audit_statefulset_immutable_drift, build_controller_lease, evaluate_cluster_invariants,
+    evaluate_lease_transition, evaluate_node_drain, evaluate_workload_admission,
     from_multi_yaml_manifests, from_yaml_manifest, to_yaml_manifest, AdmissionContext,
     AgentWorkload, AgentWorkloadSpec, ClusterInvariantReport, ClusterInventorySnapshot,
-    CpuQuantity, EgressRuleSpec, IsolationProfile, MemoryQuantity, NamespaceQuotaSpec,
-    QuotaUsageSnapshot, ScratchMedium, ScratchVolumeSpec, DEFAULT_LEASE_DURATION_SECONDS,
+    CpuQuantity, DrainClusterContext, DrainPlanReport, DriftRemediationStrategy, EgressRuleSpec,
+    ImmutableDriftReport, IsolationProfile, MemoryQuantity, NamespaceQuotaSpec, QuotaUsageSnapshot,
+    ScratchMedium, ScratchVolumeSpec, WorkloadPriorityTier, DEFAULT_LEASE_DURATION_SECONDS,
+    MAX_TERMINATION_GRACE_SECONDS,
 };
 use k8_core::{K8Client, K8Error, Result};
 use k8_orchestrator::Orchestrator;
+use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Pod, ServiceAccount};
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::rbac::v1::Role;
 use kube::api::{Api, ListParams};
@@ -51,7 +56,7 @@ enum Commands {
     /// Render the AgentWorkload CustomResourceDefinition (CRD) YAML 1.2 manifest
     Crd,
 
-    /// Audit a single or multi-document YAML 1.2 manifest against PodSecurity `restricted`, RBAC, volume, and network invariants
+    /// Audit a single or multi-document YAML 1.2 manifest against PodSecurity `restricted`, RBAC, volume, priority, and network invariants
     Audit {
         /// Path to the YAML 1.2 manifest file
         #[arg(short, long)]
@@ -82,6 +87,24 @@ enum Commands {
         /// Path to the ClusterInventorySnapshot YAML 1.2 file
         #[arg(short, long)]
         file: PathBuf,
+    },
+
+    /// Evaluate a deterministic node cordon & drain plan (`SPEC-0005`) against PDB budgets and destination Kata capacity
+    DrainPlan {
+        /// Path to the DrainClusterContext YAML 1.2 file
+        #[arg(short, long)]
+        file: PathBuf,
+    },
+
+    /// Detect immutable Kubernetes field drift (`StatefulSet`, `Job`, `PersistentVolumeClaim`) and classify remediation (`SPEC-0005`)
+    Drift {
+        /// Path to the live cluster resource YAML 1.2 file
+        #[arg(long)]
+        live: PathBuf,
+
+        /// Path to the desired GitOps resource YAML 1.2 file
+        #[arg(long)]
+        desired: PathBuf,
     },
 
     /// Render a coordination.k8s.io/v1 leader-election Lease YAML 1.2 manifest
@@ -201,6 +224,12 @@ fn audit_yaml_stream(raw_yaml: &str) -> Result<usize> {
                 audit_pod_volumes(pod_spec).map_err(|e| {
                     K8Error::Config(format!("Job volume security audit failed: {e}"))
                 })?;
+                audit_pod_priority_and_grace_period(pod_spec, MAX_TERMINATION_GRACE_SECONDS)
+                    .map_err(|e| {
+                        K8Error::Config(format!(
+                            "Job priority/grace-period security audit failed: {e}"
+                        ))
+                    })?;
             }
             "Pod" => {
                 let pod: Pod = serde_json::from_value(doc.clone())
@@ -213,6 +242,12 @@ fn audit_yaml_stream(raw_yaml: &str) -> Result<usize> {
                 audit_pod_volumes(pod_spec).map_err(|e| {
                     K8Error::Config(format!("Pod volume security audit failed: {e}"))
                 })?;
+                audit_pod_priority_and_grace_period(pod_spec, MAX_TERMINATION_GRACE_SECONDS)
+                    .map_err(|e| {
+                        K8Error::Config(format!(
+                            "Pod priority/grace-period security audit failed: {e}"
+                        ))
+                    })?;
             }
             "ServiceAccount" => {
                 let sa: ServiceAccount = serde_json::from_value(doc.clone()).map_err(|e| {
@@ -319,6 +354,92 @@ fn audit_cluster_invariants_yaml(raw_yaml: &str) -> Result<ClusterInvariantRepor
     Ok(report)
 }
 
+fn evaluate_drain_plan_yaml(raw_yaml: &str) -> Result<DrainPlanReport> {
+    let ctx: DrainClusterContext = from_yaml_manifest(raw_yaml)?;
+    let report = evaluate_node_drain(&ctx);
+    if !report.safe_to_drain {
+        let blockers = report
+            .pod_decisions
+            .iter()
+            .filter_map(|d| {
+                if let k8_api::PodEvictionAction::Blocked { reason } = &d.action {
+                    Some(format!("{}/{}: {:?}", d.namespace, d.pod_name, reason))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(K8Error::Config(format!(
+            "Node drain blocked for `{}` (digest={}, blocked={}): {blockers}",
+            report.target_node, report.plan_digest, report.blocked_count
+        )));
+    }
+    Ok(report)
+}
+
+fn evaluate_drift_yaml(live_yaml: &str, desired_yaml: &str) -> Result<ImmutableDriftReport> {
+    let live_doc: serde_json::Value = from_yaml_manifest(live_yaml)?;
+    let desired_doc: serde_json::Value = from_yaml_manifest(desired_yaml)?;
+    let live_kind = live_doc
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Unknown");
+    let desired_kind = desired_doc
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Unknown");
+    if live_kind != desired_kind {
+        return Err(K8Error::Config(format!(
+            "resource kind mismatch between live (`{live_kind}`) and desired (`{desired_kind}`)"
+        )));
+    }
+
+    let report = match live_kind {
+        "StatefulSet" => {
+            let live_sts: StatefulSet = serde_json::from_value(live_doc)
+                .map_err(|e| K8Error::Config(format!("invalid live StatefulSet: {e}")))?;
+            let desired_sts: StatefulSet = serde_json::from_value(desired_doc)
+                .map_err(|e| K8Error::Config(format!("invalid desired StatefulSet: {e}")))?;
+            audit_statefulset_immutable_drift(&live_sts, &desired_sts)
+        }
+        "Job" => {
+            let live_job: Job = serde_json::from_value(live_doc)
+                .map_err(|e| K8Error::Config(format!("invalid live Job: {e}")))?;
+            let desired_job: Job = serde_json::from_value(desired_doc)
+                .map_err(|e| K8Error::Config(format!("invalid desired Job: {e}")))?;
+            audit_job_immutable_drift(&live_job, &desired_job)
+        }
+        "PersistentVolumeClaim" => {
+            let live_pvc: PersistentVolumeClaim = serde_json::from_value(live_doc)
+                .map_err(|e| K8Error::Config(format!("invalid live PVC: {e}")))?;
+            let desired_pvc: PersistentVolumeClaim = serde_json::from_value(desired_doc)
+                .map_err(|e| K8Error::Config(format!("invalid desired PVC: {e}")))?;
+            audit_pvc_mutation(&live_pvc, &desired_pvc)
+        }
+        other => {
+            return Err(K8Error::Config(format!(
+                "unsupported resource kind `{other}` for immutable drift audit (expected StatefulSet, Job, or PersistentVolumeClaim)"
+            )));
+        }
+    };
+
+    if report.strategy == DriftRemediationStrategy::RejectedForbiddenMutation {
+        let reasons = report
+            .findings
+            .iter()
+            .map(|f| format!("{f:?}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(K8Error::Config(format!(
+            "Forbidden immutable field mutation on `{}` (digest={}): {reasons}",
+            report.resource_id, report.report_digest
+        )));
+    }
+
+    Ok(report)
+}
+
 fn render_lease_yaml(
     name: &str,
     namespace: &str,
@@ -359,7 +480,7 @@ async fn main() -> Result<()> {
             })?;
             let count = audit_yaml_stream(&raw)?;
             println!(
-                "Verified {count} YAML 1.2 document(s) in {} against PodSecurity restricted, RBAC, volume, and zero-trust invariants",
+                "Verified {count} YAML 1.2 document(s) in {} against PodSecurity restricted, RBAC, volume, priority, and zero-trust invariants",
                 file.display()
             );
             return Ok(());
@@ -398,6 +519,45 @@ async fn main() -> Result<()> {
                 file.display(),
                 report.node_summaries.len(),
                 report.warning_count,
+                report.report_digest
+            );
+            return Ok(());
+        }
+
+        Commands::DrainPlan { file } => {
+            let raw = std::fs::read_to_string(&file).map_err(|e| {
+                K8Error::Config(format!(
+                    "failed to read drain context {}: {e}",
+                    file.display()
+                ))
+            })?;
+            let report = evaluate_drain_plan_yaml(&raw)?;
+            println!(
+                "Node drain plan safe for `{}` [evicted={}, skipped={}, digest={}]",
+                report.target_node, report.evicted_count, report.skipped_count, report.plan_digest
+            );
+            return Ok(());
+        }
+
+        Commands::Drift { live, desired } => {
+            let live_raw = std::fs::read_to_string(&live).map_err(|e| {
+                K8Error::Config(format!(
+                    "failed to read live manifest {}: {e}",
+                    live.display()
+                ))
+            })?;
+            let desired_raw = std::fs::read_to_string(&desired).map_err(|e| {
+                K8Error::Config(format!(
+                    "failed to read desired manifest {}: {e}",
+                    desired.display()
+                ))
+            })?;
+            let report = evaluate_drift_yaml(&live_raw, &desired_raw)?;
+            println!(
+                "Immutable drift check for `{}`: strategy={:?}, findings={}, digest={}",
+                report.resource_id,
+                report.strategy,
+                report.findings.len(),
                 report.report_digest
             );
             return Ok(());
@@ -465,6 +625,8 @@ async fn main() -> Result<()> {
                 } else {
                     IsolationProfile::StandardRestricted
                 },
+                priority_tier: WorkloadPriorityTier::InteractiveAgent,
+                termination_grace_period_seconds: None,
                 egress,
                 scratch_volumes,
                 rbac_rules: Vec::new(),
@@ -544,6 +706,8 @@ async fn main() -> Result<()> {
                 | Commands::Audit { .. }
                 | Commands::Admit { .. }
                 | Commands::Invariants { .. }
+                | Commands::DrainPlan { .. }
+                | Commands::Drift { .. }
                 | Commands::Lease { .. }
                 | Commands::Run { .. } => {}
             }
@@ -558,9 +722,10 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use k8_api::{
-        K8sNodeSnapshot, ProviderNodeRecord, ScheduledPodFootprint, ScopedRuleSpec,
-        ServiceEndpointSnapshot,
+        DrainCandidatePod, K8sNodeSnapshot, PdbBudgetSnapshot, ProviderNodeRecord,
+        ScheduledPodFootprint, ScopedRuleSpec, ServiceEndpointSnapshot,
     };
+    use k8s_openapi::api::apps::v1::StatefulSetSpec;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     #[test]
@@ -664,5 +829,79 @@ mod tests {
         .expect("render lease");
         assert!(lease_yaml.contains("k8-orchestrator-leader"));
         assert!(lease_yaml.contains("k8-orchestrator-0"));
+    }
+
+    #[test]
+    fn test_drain_plan_and_drift_cli_helpers() {
+        let drain_ctx = DrainClusterContext {
+            target_node: "cygnus-worker-01".to_string(),
+            nodes: vec![
+                K8sNodeSnapshot {
+                    name: "cygnus-worker-01".to_string(),
+                    provider_id: Some("hetzner://1001".to_string()),
+                    ready: true,
+                    unschedulable: false,
+                    allocatable_cpu_millis: 8_000,
+                    allocatable_memory_bytes: 16 * 1024 * 1024 * 1024,
+                    kata_runtime_capable: true,
+                },
+                K8sNodeSnapshot {
+                    name: "cygnus-worker-02".to_string(),
+                    provider_id: Some("hetzner://1002".to_string()),
+                    ready: true,
+                    unschedulable: false,
+                    allocatable_cpu_millis: 8_000,
+                    allocatable_memory_bytes: 16 * 1024 * 1024 * 1024,
+                    kata_runtime_capable: true,
+                },
+            ],
+            existing_pods_on_other_nodes: vec![],
+            drain_candidates: vec![DrainCandidatePod {
+                name: "agent-01".to_string(),
+                namespace: "agent-ns".to_string(),
+                priority_tier: WorkloadPriorityTier::InteractiveAgent,
+                isolation_profile: IsolationProfile::KataMicroVm,
+                cpu_millis: 2_000,
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                is_daemonset: false,
+                is_mirror_pod: false,
+                has_unmanaged_local_storage: false,
+                pdb_name: Some("agent-pdb".to_string()),
+            }],
+            pdbs: vec![PdbBudgetSnapshot {
+                name: "agent-pdb".to_string(),
+                namespace: "agent-ns".to_string(),
+                disruptions_allowed: 1,
+            }],
+            allow_local_storage_erasure: false,
+            kata_memory_overhead_bytes: None,
+        };
+        let drain_yaml = to_yaml_manifest(&drain_ctx).expect("serialize drain context");
+        let drain_report = evaluate_drain_plan_yaml(&drain_yaml).expect("safe drain plan");
+        assert!(drain_report.safe_to_drain);
+        assert_eq!(drain_report.evicted_count, 1);
+
+        let live_sts = StatefulSet {
+            metadata: ObjectMeta {
+                name: Some("reverie-db".to_string()),
+                ..Default::default()
+            },
+            spec: Some(StatefulSetSpec {
+                service_name: Some("reverie-headless".to_string()),
+                replicas: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut desired_sts = live_sts.clone();
+        desired_sts.spec.as_mut().unwrap().replicas = Some(3);
+        let live_yaml = to_yaml_manifest(&live_sts).expect("serialize live sts");
+        let desired_yaml = to_yaml_manifest(&desired_sts).expect("serialize desired sts");
+        let drift_report =
+            evaluate_drift_yaml(&live_yaml, &desired_yaml).expect("in-place sts scale");
+        assert_eq!(
+            drift_report.strategy,
+            DriftRemediationStrategy::InPlaceApply
+        );
     }
 }

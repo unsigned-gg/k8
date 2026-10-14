@@ -2,13 +2,18 @@
 //! `k8` CLI entrypoint.
 
 use clap::{Parser, Subcommand};
-use k8_api::{AgentWorkload, AgentWorkloadSpec};
+use k8_api::{
+    audit_network_policy_zero_trust, audit_pod_spec_restricted, from_multi_yaml_manifests,
+    AgentWorkload, AgentWorkloadSpec, EgressRuleSpec, IsolationProfile,
+};
 use k8_core::{K8Client, K8Error, Result};
 use k8_orchestrator::Orchestrator;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{Api, ListParams};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -39,6 +44,13 @@ enum Commands {
 
     /// Render the AgentWorkload CustomResourceDefinition (CRD) YAML 1.2 manifest
     Crd,
+
+    /// Audit a single or multi-document YAML 1.2 manifest against PodSecurity `restricted` and zero-trust invariants
+    Audit {
+        /// Path to the YAML 1.2 manifest file
+        #[arg(short, long)]
+        file: PathBuf,
+    },
 
     /// Dispatch a one-shot autonomous agent container Job
     Run {
@@ -73,7 +85,23 @@ enum Commands {
         #[arg(short, long)]
         role: Option<String>,
 
-        /// Render the validated Kubernetes Job YAML manifest without contacting the cluster
+        /// Schedule inside a Kata Containers hardware-virtualized microVM (`runtimeClassName: kata`)
+        #[arg(long)]
+        kata: bool,
+
+        /// Allowed outbound CIDR block for zero-trust egress (repeatable, non-wildcard)
+        #[arg(long = "allow-cidr")]
+        allow_cidrs: Vec<String>,
+
+        /// Allowed outbound TCP port for zero-trust egress (repeatable)
+        #[arg(long = "allow-port")]
+        allow_ports: Vec<u16>,
+
+        /// Render the full YAML 1.2 bundle (NetworkPolicy + PodDisruptionBudget + Job) in dry-run mode
+        #[arg(long)]
+        bundle: bool,
+
+        /// Render the validated Kubernetes YAML manifest without contacting the cluster
         #[arg(long)]
         dry_run: bool,
     },
@@ -97,6 +125,54 @@ fn should_disable_ansi(plain_flag: bool) -> bool {
         || std::env::var("TERM").is_ok_and(|t| t == "dumb")
 }
 
+fn audit_yaml_stream(raw_yaml: &str) -> Result<usize> {
+    let docs: Vec<serde_json::Value> = from_multi_yaml_manifests(raw_yaml)?;
+    for doc in &docs {
+        let kind = doc
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Unknown");
+        match kind {
+            "AgentWorkload" => {
+                let wl: AgentWorkload = serde_json::from_value(doc.clone())
+                    .map_err(|e| K8Error::Config(format!("invalid AgentWorkload document: {e}")))?;
+                wl.spec.validate()?;
+            }
+            "Job" => {
+                let job: Job = serde_json::from_value(doc.clone())
+                    .map_err(|e| K8Error::Config(format!("invalid Job document: {e}")))?;
+                let pod_spec = job
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.template.spec.as_ref())
+                    .ok_or_else(|| K8Error::Config("Job missing spec.template.spec".into()))?;
+                audit_pod_spec_restricted(pod_spec).map_err(K8Error::SecurityAudit)?;
+            }
+            "Pod" => {
+                let pod: Pod = serde_json::from_value(doc.clone())
+                    .map_err(|e| K8Error::Config(format!("invalid Pod document: {e}")))?;
+                let pod_spec = pod
+                    .spec
+                    .as_ref()
+                    .ok_or_else(|| K8Error::Config("Pod missing spec".into()))?;
+                audit_pod_spec_restricted(pod_spec).map_err(K8Error::SecurityAudit)?;
+            }
+            "NetworkPolicy" => {
+                let np: NetworkPolicy = serde_json::from_value(doc.clone())
+                    .map_err(|e| K8Error::Config(format!("invalid NetworkPolicy document: {e}")))?;
+                if let Err(violations) = audit_network_policy_zero_trust(&np) {
+                    return Err(K8Error::Config(format!(
+                        "NetworkPolicy zero-trust audit failed: {}",
+                        violations.join("; ")
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(docs.len())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -117,6 +193,18 @@ async fn main() -> Result<()> {
             return Ok(());
         }
 
+        Commands::Audit { file } => {
+            let raw = std::fs::read_to_string(&file).map_err(|e| {
+                K8Error::Config(format!("failed to read manifest {}: {e}", file.display()))
+            })?;
+            let count = audit_yaml_stream(&raw)?;
+            println!(
+                "Verified {count} YAML 1.2 document(s) in {} against PodSecurity restricted and zero-trust invariants",
+                file.display()
+            );
+            return Ok(());
+        }
+
         Commands::Run {
             image,
             command,
@@ -126,8 +214,22 @@ async fn main() -> Result<()> {
             memory,
             timeout,
             role,
+            kata,
+            allow_cidrs,
+            allow_ports,
+            bundle,
             dry_run,
         } => {
+            let egress = if allow_cidrs.is_empty() && allow_ports.is_empty() {
+                None
+            } else {
+                Some(EgressRuleSpec {
+                    allow_dns: true,
+                    allowed_cidrs: allow_cidrs,
+                    allowed_tcp_ports: allow_ports,
+                })
+            };
+
             let spec = AgentWorkloadSpec {
                 image,
                 command,
@@ -138,11 +240,21 @@ async fn main() -> Result<()> {
                 gpu,
                 timeout_seconds: timeout,
                 agent_role: role,
+                isolation_profile: if kata {
+                    IsolationProfile::KataMicroVm
+                } else {
+                    IsolationProfile::StandardRestricted
+                },
+                egress,
             };
 
             if dry_run {
                 let ns = cli.namespace.as_deref().unwrap_or("default");
-                let yaml = Orchestrator::render_job_yaml("agent-dryrun", ns, &spec)?;
+                let yaml = if bundle {
+                    Orchestrator::render_workload_bundle_yaml("agent-dryrun", ns, &spec)?
+                } else {
+                    Orchestrator::render_job_yaml("agent-dryrun", ns, &spec)?
+                };
                 print!("{yaml}");
                 return Ok(());
             }
@@ -206,10 +318,34 @@ async fn main() -> Result<()> {
                     println!("Received shutdown signal. Exiting k8 daemon.");
                 }
 
-                Commands::Crd | Commands::Run { .. } => {}
+                Commands::Crd | Commands::Audit { .. } | Commands::Run { .. } => {}
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audit_yaml_stream_accepts_hardened_bundle() {
+        let spec = AgentWorkloadSpec {
+            image: "ghcr.io/unsigned-gg/agent:latest".to_string(),
+            isolation_profile: IsolationProfile::KataMicroVm,
+            egress: Some(EgressRuleSpec {
+                allow_dns: true,
+                allowed_cidrs: vec!["10.42.0.0/16".to_string()],
+                allowed_tcp_ports: vec![443],
+            }),
+            ..Default::default()
+        };
+        let bundle = Orchestrator::render_workload_bundle_yaml("agent-bundle1", "default", &spec)
+            .expect("render bundle");
+        let count = audit_yaml_stream(&bundle).expect("audit bundle");
+        assert_eq!(count, 3);
+    }
 }

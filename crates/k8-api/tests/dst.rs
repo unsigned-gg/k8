@@ -196,3 +196,115 @@ fn dst_resource_quota_and_bft_jury_invariants_100_seeds() {
         }
     }
 }
+
+#[test]
+fn dst_lifecycle_conditions_finalizers_and_network_policy_100_seeds() {
+    use k8_api::{
+        audit_network_policy_zero_trust, build_isolated_network_policy, ensure_cleanup_finalizer,
+        find_condition, has_cleanup_finalizer, remove_cleanup_finalizer, upsert_condition,
+        EgressRuleSpec, WorkloadCondition, CONDITION_ACCEPTED, CONDITION_DISPATCHED,
+        CONDITION_JURY_VERIFIED, CONDITION_READY, CONDITION_SANDBOXED,
+    };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    let condition_types = [
+        CONDITION_ACCEPTED,
+        CONDITION_SANDBOXED,
+        CONDITION_DISPATCHED,
+        CONDITION_JURY_VERIFIED,
+        CONDITION_READY,
+    ];
+    let statuses = ["False", "True", "Unknown"];
+
+    for seed in 1_u64..=100 {
+        let mut rng = SplitMix64::new(seed ^ 0xA5A5_5A5A_F0F0_0F0F);
+        let mut now_sec: u64 = 1_700_000_000;
+        let mut meta = ObjectMeta::default();
+        let mut conditions: Vec<WorkloadCondition> = Vec::new();
+        let mut expected_last_transition: BTreeMap<String, (String, String)> = BTreeMap::new();
+
+        for step in 0..200 {
+            now_sec = now_sec.saturating_add(1 + rng.range(60));
+            let iso = format!("2026-10-14T00:00:{now_sec}Z");
+
+            // 1. Exercise finalizer idempotence
+            if rng.range(3) == 0 {
+                let _ = ensure_cleanup_finalizer(&mut meta);
+                assert!(has_cleanup_finalizer(&meta));
+                // Calling ensure_cleanup_finalizer a second time is a no-op
+                assert!(!ensure_cleanup_finalizer(&mut meta));
+            } else if rng.range(5) == 0 {
+                let _ = remove_cleanup_finalizer(&mut meta);
+                assert!(!has_cleanup_finalizer(&meta));
+                assert!(!remove_cleanup_finalizer(&mut meta));
+            }
+
+            // 2. Exercise condition transition monotonicity (SPEC-0002 Invariant 1)
+            let ctype = condition_types[rng.range(condition_types.len() as u64) as usize];
+            let status = statuses[rng.range(statuses.len() as u64) as usize];
+            let reason = format!("Step{step}Reason");
+
+            let prev = expected_last_transition.get(ctype).cloned();
+            upsert_condition(
+                &mut conditions,
+                WorkloadCondition {
+                    type_: ctype.to_string(),
+                    status: status.to_string(),
+                    reason: reason.clone(),
+                    message: Some(format!("step={step}")),
+                    last_transition_time: iso.clone(),
+                },
+            );
+
+            let observed = find_condition(&conditions, ctype).expect("condition must exist");
+            assert_eq!(observed.status, status);
+            assert_eq!(observed.reason, reason);
+
+            match prev {
+                Some((prev_status, prev_ts)) if prev_status == status => {
+                    assert_eq!(
+                        observed.last_transition_time, prev_ts,
+                        "seed={seed} step={step}: unchanged status must preserve last_transition_time"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        observed.last_transition_time, iso,
+                        "seed={seed} step={step}: changed status must update last_transition_time"
+                    );
+                    expected_last_transition
+                        .insert(ctype.to_string(), (status.to_string(), iso.clone()));
+                }
+            }
+
+            // Conditions list must remain strictly sorted and deduplicated by `type_`
+            for pair in conditions.windows(2) {
+                assert!(
+                    pair[0].type_ < pair[1].type_,
+                    "seed={seed}: conditions must be strictly sorted and unique by type_"
+                );
+            }
+
+            // 3. Exercise zero-trust NetworkPolicy synthesis & audit (SPEC-0002 Invariant 3)
+            if step % 20 == 0 {
+                let octet = 1 + rng.range(250);
+                let egress = EgressRuleSpec {
+                    allow_dns: rng.range(2) == 1,
+                    allowed_cidrs: vec![format!("10.{octet}.0.0/16")],
+                    allowed_tcp_ports: vec![443],
+                };
+                let netpol = build_isolated_network_policy(
+                    &format!("agent-s{seed}"),
+                    "default",
+                    Some("researcher"),
+                    Some(&egress),
+                )
+                .expect("valid isolated network policy");
+                assert!(
+                    audit_network_policy_zero_trust(&netpol).is_ok(),
+                    "seed={seed}: synthesized NetworkPolicy must pass zero-trust audit"
+                );
+            }
+        }
+    }
+}

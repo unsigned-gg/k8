@@ -4,16 +4,17 @@
 use clap::{Parser, Subcommand};
 use k8_api::{
     audit_job_immutable_drift, audit_network_policy_zero_trust,
-    audit_pod_priority_and_grace_period, audit_pod_spec_restricted, audit_pod_volumes,
-    audit_pvc_mutation, audit_role_least_privilege, audit_service_account_zero_trust,
-    audit_statefulset_immutable_drift, build_controller_lease, evaluate_cluster_invariants,
-    evaluate_lease_transition, evaluate_node_drain, evaluate_workload_admission,
+    audit_pod_priority_and_grace_period, audit_pod_probes, audit_pod_secret_and_token_hygiene,
+    audit_pod_spec_restricted, audit_pod_volumes, audit_pvc_mutation, audit_role_least_privilege,
+    audit_service_account_zero_trust, audit_statefulset_immutable_drift, build_controller_lease,
+    build_immutable_config_map, evaluate_cluster_invariants, evaluate_lease_transition,
+    evaluate_node_drain, evaluate_rollout_quorum, evaluate_workload_admission,
     from_multi_yaml_manifests, from_yaml_manifest, to_yaml_manifest, AdmissionContext,
     AgentWorkload, AgentWorkloadSpec, ClusterInvariantReport, ClusterInventorySnapshot,
     CpuQuantity, DrainClusterContext, DrainPlanReport, DriftRemediationStrategy, EgressRuleSpec,
     ImmutableDriftReport, IsolationProfile, MemoryQuantity, NamespaceQuotaSpec, QuotaUsageSnapshot,
-    ScratchMedium, ScratchVolumeSpec, WorkloadPriorityTier, DEFAULT_LEASE_DURATION_SECONDS,
-    MAX_TERMINATION_GRACE_SECONDS,
+    RolloutQuorumReport, RolloutQuorumSpec, ScratchMedium, ScratchVolumeSpec, WorkloadPriorityTier,
+    DEFAULT_LEASE_DURATION_SECONDS, MAX_TERMINATION_GRACE_SECONDS,
 };
 use k8_core::{K8Client, K8Error, Result};
 use k8_orchestrator::Orchestrator;
@@ -56,7 +57,7 @@ enum Commands {
     /// Render the AgentWorkload CustomResourceDefinition (CRD) YAML 1.2 manifest
     Crd,
 
-    /// Audit a single or multi-document YAML 1.2 manifest against PodSecurity `restricted`, RBAC, volume, priority, and network invariants
+    /// Audit a single or multi-document YAML 1.2 manifest against PodSecurity `restricted`, RBAC, volume, priority, secret, probe, and network invariants
     Audit {
         /// Path to the YAML 1.2 manifest file
         #[arg(short, long)]
@@ -105,6 +106,24 @@ enum Commands {
         /// Path to the desired GitOps resource YAML 1.2 file
         #[arg(long)]
         desired: PathBuf,
+    },
+
+    /// Render a content-addressed immutable v1/ConfigMap YAML 1.2 manifest (`SPEC-0006`)
+    ConfigMap {
+        /// Base name prefix (DNS-1123 label, suffixed with -<hash8>)
+        #[arg(long)]
+        name: String,
+
+        /// Key-value entries in KEY=VALUE format (repeatable)
+        #[arg(long = "from-literal", num_args = 1..)]
+        literals: Vec<String>,
+    },
+
+    /// Verify Deployment RollingUpdate surge/unavailable bounds against PDB minAvailable quorum (`SPEC-0006`)
+    RolloutCheck {
+        /// Path to the RolloutQuorumSpec YAML 1.2 file
+        #[arg(short, long)]
+        file: PathBuf,
     },
 
     /// Render a coordination.k8s.io/v1 leader-election Lease YAML 1.2 manifest
@@ -230,6 +249,11 @@ fn audit_yaml_stream(raw_yaml: &str) -> Result<usize> {
                             "Job priority/grace-period security audit failed: {e}"
                         ))
                     })?;
+                audit_pod_secret_and_token_hygiene(pod_spec).map_err(|e| {
+                    K8Error::Config(format!("Job secret/token hygiene audit failed: {e}"))
+                })?;
+                audit_pod_probes(pod_spec)
+                    .map_err(|e| K8Error::Config(format!("Job probe timing audit failed: {e}")))?;
             }
             "Pod" => {
                 let pod: Pod = serde_json::from_value(doc.clone())
@@ -248,6 +272,11 @@ fn audit_yaml_stream(raw_yaml: &str) -> Result<usize> {
                             "Pod priority/grace-period security audit failed: {e}"
                         ))
                     })?;
+                audit_pod_secret_and_token_hygiene(pod_spec).map_err(|e| {
+                    K8Error::Config(format!("Pod secret/token hygiene audit failed: {e}"))
+                })?;
+                audit_pod_probes(pod_spec)
+                    .map_err(|e| K8Error::Config(format!("Pod probe timing audit failed: {e}")))?;
             }
             "ServiceAccount" => {
                 let sa: ServiceAccount = serde_json::from_value(doc.clone()).map_err(|e| {
@@ -440,6 +469,31 @@ fn evaluate_drift_yaml(live_yaml: &str, desired_yaml: &str) -> Result<ImmutableD
     Ok(report)
 }
 
+fn render_immutable_configmap_yaml(
+    base_name: &str,
+    namespace: &str,
+    literals: &[String],
+) -> Result<String> {
+    let mut data = BTreeMap::new();
+    for entry in literals {
+        let Some((k, v)) = entry.split_once('=') else {
+            return Err(K8Error::Config(format!(
+                "invalid --from-literal `{entry}` (expected KEY=VALUE)"
+            )));
+        };
+        data.insert(k.to_string(), v.to_string());
+    }
+    let cm = build_immutable_config_map(base_name, namespace, &data)
+        .map_err(|e| K8Error::Config(format!("failed to build immutable ConfigMap: {e}")))?;
+    Ok(to_yaml_manifest(&cm)?)
+}
+
+fn evaluate_rollout_check_yaml(raw_yaml: &str) -> Result<RolloutQuorumReport> {
+    let spec: RolloutQuorumSpec = from_yaml_manifest(raw_yaml)?;
+    evaluate_rollout_quorum(&spec)
+        .map_err(|e| K8Error::Config(format!("rollout quorum audit failed: {e}")))
+}
+
 fn render_lease_yaml(
     name: &str,
     namespace: &str,
@@ -480,7 +534,7 @@ async fn main() -> Result<()> {
             })?;
             let count = audit_yaml_stream(&raw)?;
             println!(
-                "Verified {count} YAML 1.2 document(s) in {} against PodSecurity restricted, RBAC, volume, priority, and zero-trust invariants",
+                "Verified {count} YAML 1.2 document(s) in {} against PodSecurity restricted, RBAC, volume, priority, secret, probe, and zero-trust invariants",
                 file.display()
             );
             return Ok(());
@@ -559,6 +613,31 @@ async fn main() -> Result<()> {
                 report.strategy,
                 report.findings.len(),
                 report.report_digest
+            );
+            return Ok(());
+        }
+
+        Commands::ConfigMap { name, literals } => {
+            let ns = cli.namespace.as_deref().unwrap_or("default");
+            let yaml = render_immutable_configmap_yaml(&name, ns, &literals)?;
+            print!("{yaml}");
+            return Ok(());
+        }
+
+        Commands::RolloutCheck { file } => {
+            let raw = std::fs::read_to_string(&file).map_err(|e| {
+                K8Error::Config(format!(
+                    "failed to read rollout quorum spec {}: {e}",
+                    file.display()
+                ))
+            })?;
+            let report = evaluate_rollout_check_yaml(&raw)?;
+            println!(
+                "Rollout quorum safe in {} [min_ready={}, peak={}, pdb_min={}]",
+                file.display(),
+                report.min_ready_during_rollout,
+                report.max_total_pods_during_rollout,
+                report.pdb_min_available
             );
             return Ok(());
         }
@@ -708,6 +787,8 @@ async fn main() -> Result<()> {
                 | Commands::Invariants { .. }
                 | Commands::DrainPlan { .. }
                 | Commands::Drift { .. }
+                | Commands::ConfigMap { .. }
+                | Commands::RolloutCheck { .. }
                 | Commands::Lease { .. }
                 | Commands::Run { .. } => {}
             }
@@ -903,5 +984,29 @@ mod tests {
             drift_report.strategy,
             DriftRemediationStrategy::InPlaceApply
         );
+    }
+
+    #[test]
+    fn test_configmap_and_rollout_check_cli_helpers() {
+        let cm_yaml = render_immutable_configmap_yaml(
+            "agent-cfg",
+            "agent-ns",
+            &["LOG_LEVEL=info".to_string(), "PORT=8080".to_string()],
+        )
+        .expect("render immutable ConfigMap");
+        assert!(cm_yaml.contains("immutable: true"));
+        assert!(cm_yaml.contains("agent-cfg-"));
+
+        let rollout_spec = RolloutQuorumSpec {
+            workload_id: "agent-ns/reverie".to_string(),
+            replicas: 4,
+            max_unavailable: 1,
+            max_surge: 1,
+            pdb_min_available: 3,
+        };
+        let rollout_yaml = to_yaml_manifest(&rollout_spec).expect("serialize rollout spec");
+        let report = evaluate_rollout_check_yaml(&rollout_yaml).expect("valid rollout quorum");
+        assert_eq!(report.min_ready_during_rollout, 3);
+        assert_eq!(report.max_total_pods_during_rollout, 5);
     }
 }

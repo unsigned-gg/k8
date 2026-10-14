@@ -27,7 +27,7 @@ use crate::selector::{canonical_workload_labels, validate_dns1123_label};
 use crate::storage::{build_scratch_volume_and_mount, ScratchVolumeSpec};
 use crate::{AgentWorkload, SpecValidationError};
 
-/// Policy gate identifier in the admission pipeline (`SPEC-0003` & `SPEC-0005`).
+/// Policy gate identifier in the admission pipeline (`SPEC-0003`, `SPEC-0005` & `SPEC-0006`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum AdmissionGate {
     /// Workload metadata, DNS-1123 naming, and core spec fields.
@@ -42,6 +42,10 @@ pub enum AdmissionGate {
     VolumeHygiene,
     /// PriorityClass tier and bounded termination grace period (`SPEC-0005`).
     PriorityAndGracePeriod,
+    /// Zero plaintext secret env vars and bounded KEP-1205 token projection (`SPEC-0006`).
+    SecretAndTokenHygiene,
+    /// Deterministic startup/readiness/liveness probe timing bounds (`SPEC-0006`).
+    ProbeTiming,
     /// Namespace `ResourceQuota` headroom (including Kata MicroVM overhead).
     NamespaceQuota,
     /// BFT jury execution receipt verification.
@@ -131,6 +135,8 @@ pub fn evaluate_workload_admission(
             SpecValidationError::InvalidRbac(_) => AdmissionGate::LeastPrivilegeRbac,
             SpecValidationError::InvalidStorage(_) => AdmissionGate::VolumeHygiene,
             SpecValidationError::InvalidPriority(_) => AdmissionGate::PriorityAndGracePeriod,
+            SpecValidationError::InvalidSecretHygiene(_) => AdmissionGate::SecretAndTokenHygiene,
+            SpecValidationError::InvalidProbe(_) => AdmissionGate::ProbeTiming,
             SpecValidationError::InvalidImage(_)
             | SpecValidationError::InvalidLabel(_)
             | SpecValidationError::InvalidTimeout(_)

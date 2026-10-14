@@ -9,14 +9,14 @@ pub use reconciler::{
 };
 
 use k8_api::{
-    audit_pod_priority_and_grace_period, audit_pod_spec_restricted, audit_pod_volumes,
-    build_dedicated_service_account, build_isolated_network_policy, build_scoped_role,
-    build_scoped_role_binding, build_scratch_volume_and_mount, build_workload_pdb,
-    build_workload_tolerations, canonical_workload_labels, ensure_cleanup_finalizer,
-    remove_cleanup_finalizer, restricted_container_security_context,
-    restricted_pod_security_context, to_yaml_manifest, AgentWorkload, AgentWorkloadSpec,
-    ScratchVolumeSpec, WorkloadPhase, DEFAULT_TERMINATION_GRACE_SECONDS, LABEL_MANAGED_BY,
-    MAX_TERMINATION_GRACE_SECONDS,
+    audit_pod_priority_and_grace_period, audit_pod_probes, audit_pod_secret_and_token_hygiene,
+    audit_pod_spec_restricted, audit_pod_volumes, build_dedicated_service_account,
+    build_isolated_network_policy, build_scoped_role, build_scoped_role_binding,
+    build_scratch_volume_and_mount, build_workload_pdb, build_workload_tolerations,
+    canonical_workload_labels, ensure_cleanup_finalizer, remove_cleanup_finalizer,
+    restricted_container_security_context, restricted_pod_security_context, to_yaml_manifest,
+    AgentWorkload, AgentWorkloadSpec, ScratchVolumeSpec, WorkloadPhase,
+    DEFAULT_TERMINATION_GRACE_SECONDS, LABEL_MANAGED_BY, MAX_TERMINATION_GRACE_SECONDS,
 };
 use k8_core::{delete_foreground_params, list_by_selector, K8Client, K8Error, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
@@ -167,6 +167,8 @@ impl Orchestrator {
         audit_pod_volumes(&pod_spec).map_err(k8_api::SpecValidationError::from)?;
         audit_pod_priority_and_grace_period(&pod_spec, MAX_TERMINATION_GRACE_SECONDS)
             .map_err(k8_api::SpecValidationError::from)?;
+        audit_pod_secret_and_token_hygiene(&pod_spec).map_err(k8_api::SpecValidationError::from)?;
+        audit_pod_probes(&pod_spec).map_err(k8_api::SpecValidationError::from)?;
 
         let active_deadline = spec.timeout_seconds.and_then(|s| i64::try_from(s).ok());
 

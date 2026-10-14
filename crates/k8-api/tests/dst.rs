@@ -921,3 +921,222 @@ fn dst_node_drain_binpacking_pdb_and_immutable_drift_100_seeds() {
         }
     }
 }
+
+#[test]
+fn dst_immutable_configs_secret_hygiene_probes_and_rollout_quorum_100_seeds() {
+    use k8_api::{
+        audit_pod_probes, audit_pod_secret_and_token_hygiene, build_http_get_probe,
+        build_immutable_config_map, build_immutable_secret, build_projected_token_volume,
+        compute_kv_content_hash, evaluate_rollout_quorum, BoundTokenProjectionSpec, HttpProbeSpec,
+        ProbeError, RolloutQuorumSpec, SecretHygieneError,
+    };
+    use k8s_openapi::api::core::v1::{
+        Container, EnvVar, EnvVarSource, ExecAction, Probe, SecretKeySelector, VolumeMount,
+    };
+
+    for seed in 0..100_u64 {
+        let mut rng = SplitMix64::new(seed ^ 0x6006_e5b2_ad1e_f005);
+
+        for step in 0..40_u64 {
+            // INV-0006-01: Content-Addressed Immutable Config Determinism
+            let mut entries_a = BTreeMap::new();
+            let mut entries_b = BTreeMap::new();
+            let key_count = 1 + rng.range(5);
+            for k in 0..key_count {
+                let key = format!("CONFIG_KEY_{k}");
+                let val = format!("val-{seed}-{step}-{}", rng.range(10_000));
+                entries_a.insert(key.clone(), val.clone());
+                entries_b.insert(key, val);
+            }
+            let h1 = compute_kv_content_hash(&entries_a);
+            let h2 = compute_kv_content_hash(&entries_b);
+            assert_eq!(h1, h2);
+            assert_eq!(h1.len(), 8);
+
+            let cm1 = build_immutable_config_map("agent-cfg", "agent-ns", &entries_a).expect("cm1");
+            let cm2 = build_immutable_config_map("agent-cfg", "agent-ns", &entries_b).expect("cm2");
+            assert_eq!(cm1, cm2);
+            assert_eq!(cm1.immutable, Some(true));
+            assert_eq!(
+                cm1.metadata.name.as_deref(),
+                Some(format!("agent-cfg-{h1}").as_str())
+            );
+
+            let sec1 = build_immutable_secret("agent-sec", "agent-ns", &entries_a).expect("sec1");
+            assert_eq!(sec1.immutable, Some(true));
+            assert_eq!(
+                sec1.metadata.name.as_deref(),
+                Some(format!("agent-sec-{h1}").as_str())
+            );
+
+            let mut mutated_entries = entries_a.clone();
+            mutated_entries.insert("EXTRA_KEY".to_string(), "mutated".to_string());
+            let cm_mut = build_immutable_config_map("agent-cfg", "agent-ns", &mutated_entries)
+                .expect("cm_mut");
+            assert_ne!(cm1.metadata.name, cm_mut.metadata.name);
+
+            // Reject empty secret value body
+            let mut empty_sec_entries = entries_a.clone();
+            empty_sec_entries.insert("API_TOKEN".to_string(), "   ".to_string());
+            assert!(matches!(
+                build_immutable_secret("agent-sec", "agent-ns", &empty_sec_entries),
+                Err(SecretHygieneError::EmptySecretValueBody(_))
+            ));
+
+            // INV-0006-02: Zero Plaintext Secret Env Vars & Bounded Token Expiry
+            let ttl = 600 + rng.range(3001) as i64;
+            let (tok_vol, tok_mount) = build_projected_token_volume(&BoundTokenProjectionSpec {
+                volume_name: "vault-token".to_string(),
+                mount_path: "/var/run/secrets/tokens".to_string(),
+                token_rel_path: "token".to_string(),
+                audience: "openbao.unsigned.gg".to_string(),
+                expiration_seconds: ttl,
+            })
+            .expect("valid projected token");
+
+            let good_pod = PodSpec {
+                volumes: Some(vec![tok_vol]),
+                containers: vec![Container {
+                    name: "agent".to_string(),
+                    env: Some(vec![EnvVar {
+                        name: "OPENBAO_API_TOKEN".to_string(),
+                        value: None,
+                        value_from: Some(EnvVarSource {
+                            secret_key_ref: Some(SecretKeySelector {
+                                name: "agent-sec".to_string(),
+                                key: "API_TOKEN".to_string(),
+                                optional: Some(false),
+                            }),
+                            ..Default::default()
+                        }),
+                    }]),
+                    volume_mounts: Some(vec![tok_mount]),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(audit_pod_secret_and_token_hygiene(&good_pod).is_ok());
+
+            let bad_pod = PodSpec {
+                containers: vec![Container {
+                    name: "agent".to_string(),
+                    env: Some(vec![EnvVar {
+                        name: "LITELLM_API_KEY".to_string(),
+                        value: Some("sk-plaintext-leak".to_string()),
+                        value_from: None,
+                    }]),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(matches!(
+                audit_pod_secret_and_token_hygiene(&bad_pod),
+                Err(SecretHygieneError::PlaintextSensitiveEnvVar { .. })
+            ));
+
+            // INV-0006-03: Probe Timing & Shell-Free Containment
+            let period_seconds = 5 + rng.range(15) as i32;
+            let timeout_seconds = 1 + rng.range(period_seconds as u64) as i32;
+            let liveness_threshold = 2 + rng.range(4) as i32;
+            let startup_threshold = liveness_threshold + 1 + rng.range(10) as i32;
+
+            let liveness_probe = build_http_get_probe(&HttpProbeSpec {
+                path: "/healthz".to_string(),
+                port: 8080,
+                initial_delay_seconds: 0,
+                period_seconds,
+                timeout_seconds,
+                failure_threshold: liveness_threshold,
+                success_threshold: 1,
+            })
+            .expect("valid liveness");
+            let readiness_probe = build_http_get_probe(&HttpProbeSpec {
+                path: "/readyz".to_string(),
+                port: 8080,
+                initial_delay_seconds: 0,
+                period_seconds,
+                timeout_seconds,
+                failure_threshold: 3,
+                success_threshold: 1,
+            })
+            .expect("valid readiness");
+            let startup_probe = build_http_get_probe(&HttpProbeSpec {
+                path: "/healthz".to_string(),
+                port: 8080,
+                initial_delay_seconds: 0,
+                period_seconds,
+                timeout_seconds,
+                failure_threshold: startup_threshold,
+                success_threshold: 1,
+            })
+            .expect("valid startup");
+
+            let probed_pod = PodSpec {
+                containers: vec![Container {
+                    name: "agent".to_string(),
+                    liveness_probe: Some(liveness_probe),
+                    readiness_probe: Some(readiness_probe),
+                    startup_probe: Some(startup_probe),
+                    volume_mounts: Some(vec![VolumeMount {
+                        name: "tmp".to_string(),
+                        mount_path: "/tmp".to_string(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(audit_pod_probes(&probed_pod).is_ok());
+
+            let exec_probe_pod = PodSpec {
+                containers: vec![Container {
+                    name: "agent".to_string(),
+                    liveness_probe: Some(Probe {
+                        exec: Some(ExecAction {
+                            command: Some(vec!["sh".to_string(), "-c".to_string()]),
+                        }),
+                        period_seconds: Some(10),
+                        timeout_seconds: Some(2),
+                        failure_threshold: Some(3),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(matches!(
+                audit_pod_probes(&exec_probe_pod),
+                Err(ProbeError::ForbiddenShellExecProbe { .. })
+            ));
+
+            // INV-0006-04: Rollout vs. PDB Quorum Conservation
+            let replicas = 2 + rng.range(10) as u32;
+            let max_unavailable = rng.range(replicas as u64) as u32;
+            let max_surge = if max_unavailable == 0 {
+                1 + rng.range(3) as u32
+            } else {
+                rng.range(3) as u32
+            };
+            let pdb_min_available = rng.range(u64::from(replicas + 1)) as u32;
+
+            let q1 = evaluate_rollout_quorum(&RolloutQuorumSpec {
+                workload_id: format!("agent-ns/svc-{seed}-{step}"),
+                replicas,
+                max_unavailable,
+                max_surge,
+                pdb_min_available,
+            });
+            let q2 = evaluate_rollout_quorum(&RolloutQuorumSpec {
+                workload_id: format!("agent-ns/svc-{seed}-{step}"),
+                replicas,
+                max_unavailable,
+                max_surge,
+                pdb_min_available,
+            });
+            assert_eq!(q1, q2);
+            let expected_safe = replicas.saturating_sub(max_unavailable) >= pdb_min_available
+                && (max_unavailable > 0 || max_surge > 0);
+            assert_eq!(q1.is_ok(), expected_safe);
+        }
+    }
+}

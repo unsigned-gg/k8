@@ -308,3 +308,177 @@ fn dst_lifecycle_conditions_finalizers_and_network_policy_100_seeds() {
         }
     }
 }
+
+#[test]
+fn dst_rbac_quota_storage_and_admission_100_seeds() {
+    use k8_api::{
+        audit_pod_volumes, audit_role_least_privilege, audit_service_account_zero_trust,
+        build_dedicated_service_account, build_scoped_role, build_scratch_volume_and_mount,
+        evaluate_quota_admission, evaluate_workload_admission, AdmissionContext, AdmissionGate,
+        AgentWorkload, AgentWorkloadSpec, EgressRuleSpec, IsolationProfile, NamespaceQuotaSpec,
+        QuotaUsageSnapshot, ScopedRuleSpec, ScratchMedium, ScratchVolumeSpec,
+        DEFAULT_KATA_MEMORY_OVERHEAD_BYTES, DEFAULT_QUOTA_WARN_PERMILLE,
+    };
+
+    let ns_quota = NamespaceQuotaSpec {
+        max_cpu_millis: 16_000,
+        max_memory_bytes: 32 * 1024 * 1024 * 1024,
+        max_pods: 8,
+        warn_threshold_permille: DEFAULT_QUOTA_WARN_PERMILLE,
+    };
+
+    for seed in 1_u64..=100 {
+        let mut rng = SplitMix64::new(seed ^ 0x1357_9BDF_2468_ACE0);
+        let mut usage = QuotaUsageSnapshot::default();
+        let mut active: Vec<(u64, u64, IsolationProfile)> = Vec::new();
+
+        for step in 0..150 {
+            let action = rng.range(4);
+            match action {
+                0 => {
+                    // Attempt to admit a workload through the full multi-gate admission engine
+                    let cpu_m = (1 + rng.range(4)) * 1_000;
+                    let mem_gi = 1 + rng.range(4);
+                    let cpu_str = format!("{cpu_m}m");
+                    let mem_str = format!("{mem_gi}Gi");
+                    let profile = if rng.range(2) == 0 {
+                        IsolationProfile::KataMicroVm
+                    } else {
+                        IsolationProfile::StandardRestricted
+                    };
+
+                    let spec = AgentWorkloadSpec {
+                        image: "ghcr.io/unsigned-gg/agent:latest".to_string(),
+                        cpu: Some(cpu_str.clone()),
+                        memory: Some(mem_str.clone()),
+                        isolation_profile: profile,
+                        egress: Some(EgressRuleSpec {
+                            allow_dns: true,
+                            allowed_cidrs: vec!["10.42.0.0/16".to_string()],
+                            allowed_tcp_ports: vec![443],
+                        }),
+                        scratch_volumes: vec![ScratchVolumeSpec {
+                            name: "scratch-tmp".to_string(),
+                            mount_path: "/tmp".to_string(),
+                            size_limit: "64Mi".to_string(),
+                            medium: ScratchMedium::Memory,
+                        }],
+                        rbac_rules: vec![ScopedRuleSpec {
+                            api_group: String::new(),
+                            resource: "configmaps".to_string(),
+                            verbs: vec!["get".to_string()],
+                            resource_names: vec![format!("cfg-{step}")],
+                        }],
+                        ..Default::default()
+                    };
+
+                    let (vol, mount) =
+                        build_scratch_volume_and_mount(&spec.scratch_volumes[0]).expect("scratch");
+                    let pod_spec = PodSpec {
+                        automount_service_account_token: Some(false),
+                        security_context: Some(restricted_pod_security_context()),
+                        volumes: Some(vec![vol]),
+                        containers: vec![Container {
+                            name: "agent".to_string(),
+                            security_context: Some(restricted_container_security_context()),
+                            volume_mounts: Some(vec![mount]),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    };
+                    assert!(audit_pod_volumes(&pod_spec).is_ok());
+
+                    let ctx = AdmissionContext {
+                        quota: Some((ns_quota.clone(), usage.clone())),
+                        required_receipt: None,
+                    };
+                    let run_id = format!("agent-s{seed}-{step}");
+                    let mut workload = AgentWorkload::new(&run_id, spec);
+                    workload.metadata.namespace = Some("agent-ns".to_string());
+
+                    let outcome1 = evaluate_workload_admission(&workload, &ctx);
+                    let outcome2 = evaluate_workload_admission(&workload, &ctx);
+                    // Invariant 4: Admission evaluation is deterministic
+                    assert_eq!(outcome1, outcome2);
+
+                    let quota_res =
+                        evaluate_quota_admission(&ns_quota, &usage, 1, &cpu_str, &mem_str, profile);
+
+                    assert_eq!(outcome1.allowed, quota_res.is_ok());
+                    if let Ok(report) = quota_res {
+                        usage = QuotaUsageSnapshot {
+                            used_cpu_millis: report.projected_cpu_millis,
+                            used_memory_bytes: report.projected_memory_bytes,
+                            used_pods: report.projected_pods,
+                        };
+                        active.push((cpu_m, mem_gi * 1024 * 1024 * 1024, profile));
+                    } else {
+                        assert!(outcome1
+                            .violations
+                            .iter()
+                            .any(|v| v.gate == AdmissionGate::NamespaceQuota));
+                    }
+                }
+                1 => {
+                    // Release a workload and verify Kata memory overhead conservation
+                    if !active.is_empty() {
+                        let idx = rng.range(active.len() as u64) as usize;
+                        let (cpu_m, mem_bytes, profile) = active.swap_remove(idx);
+                        let eff_mem = match profile {
+                            IsolationProfile::KataMicroVm => {
+                                mem_bytes.saturating_add(DEFAULT_KATA_MEMORY_OVERHEAD_BYTES)
+                            }
+                            IsolationProfile::StandardRestricted => mem_bytes,
+                        };
+                        usage.used_cpu_millis -= cpu_m;
+                        usage.used_memory_bytes -= eff_mem;
+                        usage.used_pods -= 1;
+                    }
+                }
+                _ => {
+                    // Exercise RBAC least-privilege builders and adversarial rejection
+                    let sa = build_dedicated_service_account(
+                        "agent-rbac",
+                        "agent-ns",
+                        BTreeMap::new(),
+                        false,
+                    )
+                    .expect("sa");
+                    assert!(audit_service_account_zero_trust(&sa).is_ok());
+
+                    let role = build_scoped_role(
+                        "agent-rbac",
+                        "agent-ns",
+                        BTreeMap::new(),
+                        &[ScopedRuleSpec {
+                            api_group: String::new(),
+                            resource: "secrets".to_string(),
+                            verbs: vec!["get".to_string()],
+                            resource_names: vec!["named-secret".to_string()],
+                        }],
+                    )
+                    .expect("scoped role");
+                    assert!(audit_role_least_privilege(&role).is_ok());
+                }
+            }
+
+            // Verify exact Kata overhead + container memory conservation
+            let expected_pods = active.len() as u32;
+            let expected_cpu: u64 = active.iter().map(|(c, _, _)| *c).sum();
+            let expected_mem: u64 = active
+                .iter()
+                .map(|(_, m, p)| match p {
+                    IsolationProfile::KataMicroVm => *m + DEFAULT_KATA_MEMORY_OVERHEAD_BYTES,
+                    IsolationProfile::StandardRestricted => *m,
+                })
+                .sum();
+
+            assert_eq!(usage.used_pods, expected_pods);
+            assert_eq!(usage.used_cpu_millis, expected_cpu);
+            assert_eq!(usage.used_memory_bytes, expected_mem);
+            assert!(usage.used_pods <= ns_quota.max_pods);
+            assert!(usage.used_cpu_millis <= ns_quota.max_cpu_millis);
+            assert!(usage.used_memory_bytes <= ns_quota.max_memory_bytes);
+        }
+    }
+}

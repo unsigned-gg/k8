@@ -3,15 +3,23 @@
 //! PodSecurity `restricted` invariants, `OwnerReference` & finalizer lifecycle algebra,
 //! zero-trust `NetworkPolicy` builders, scheduling primitives, and `3f + 1` BFT jury quorums.
 
+pub mod admission;
 pub mod jury;
 pub mod lifecycle;
 pub mod manifest;
 pub mod network;
 pub mod quantity;
+pub mod quota;
+pub mod rbac;
 pub mod scheduling;
 pub mod security;
 pub mod selector;
+pub mod storage;
 
+pub use admission::{
+    evaluate_workload_admission, AdmissionContext, AdmissionGate, AdmissionReviewOutcome,
+    AdmissionViolation,
+};
 pub use jury::{
     EquivocationFault, ExecutionReceipt, JuryError, JuryQuorum, JuryVote, VerdictOutcome,
 };
@@ -33,6 +41,16 @@ pub use network::{
 pub use quantity::{
     CpuQuantity, MemoryQuantity, QuantityError, ResourceQuotaSpec, ResourceRequest, ResourceUsage,
 };
+pub use quota::{
+    build_namespace_limit_range, build_namespace_resource_quota, evaluate_quota_admission,
+    NamespaceQuotaSpec, QuotaError, QuotaHeadroomReport, QuotaUsageSnapshot,
+    DEFAULT_KATA_MEMORY_OVERHEAD_BYTES, DEFAULT_QUOTA_WARN_PERMILLE,
+};
+pub use rbac::{
+    audit_role_least_privilege, audit_service_account_zero_trust, build_dedicated_service_account,
+    build_scoped_role, build_scoped_role_binding, RbacError, ScopedRuleSpec,
+    ALLOWED_READ_ONLY_VERBS, FORBIDDEN_ESCALATION_VERBS,
+};
 pub use scheduling::{
     build_hostname_spread_constraint, build_workload_pdb, build_workload_tolerations,
     IsolationProfile, RUNTIME_CLASS_KATA, TAINT_KEY_AGENT_POOL, TAINT_KEY_GPU,
@@ -45,6 +63,11 @@ pub use security::{
 pub use selector::{
     canonical_workload_labels, validate_dns1123_label, validate_label_key, validate_label_value,
     LabelError, LabelSelector, LABEL_AGENT_ROLE, LABEL_APP_NAME, LABEL_MANAGED_BY, LABEL_RUN_ID,
+};
+pub use storage::{
+    audit_pod_volumes, build_scratch_volume_and_mount, validate_mount_path, ScratchMedium,
+    ScratchVolumeSpec, StorageError, DEFAULT_SCRATCH_MOUNT_PATH, DEFAULT_SCRATCH_SIZE_LIMIT,
+    DEFAULT_SCRATCH_VOLUME_NAME, FORBIDDEN_MOUNT_PREFIXES,
 };
 
 use kube::{CustomResource, CustomResourceExt};
@@ -80,6 +103,14 @@ pub enum SpecValidationError {
     /// Zero-trust egress specification failed CIDR or port validation.
     #[error("invalid network egress rule in workload spec: {0}")]
     InvalidNetworkPolicy(#[from] NetworkPolicyError),
+
+    /// Scoped RBAC rule failed least-privilege validation.
+    #[error("invalid RBAC rule in workload spec: {0}")]
+    InvalidRbac(#[from] RbacError),
+
+    /// Ephemeral scratch volume failed storage validation.
+    #[error("invalid scratch volume in workload spec: {0}")]
+    InvalidStorage(#[from] StorageError),
 
     /// Timeout is zero or exceeds [`MAX_TIMEOUT_SECONDS`].
     #[error("timeout_seconds ({0}) must be between 1 and {MAX_TIMEOUT_SECONDS}")]
@@ -148,6 +179,14 @@ pub struct AgentWorkloadSpec {
     /// Optional zero-trust outbound network egress rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressRuleSpec>,
+
+    /// Optional bounded ephemeral scratch volumes (defaults to a `64Mi` `/tmp` `Memory` volume when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scratch_volumes: Vec<ScratchVolumeSpec>,
+
+    /// Optional least-privilege namespace-scoped read-only RBAC rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rbac_rules: Vec<ScopedRuleSpec>,
 }
 
 impl AgentWorkloadSpec {
@@ -177,6 +216,14 @@ impl AgentWorkloadSpec {
                     NetworkPolicyError::InvalidPortZero,
                 ));
             }
+        }
+
+        if !self.rbac_rules.is_empty() {
+            build_scoped_role("validate", "default", BTreeMap::new(), &self.rbac_rules)?;
+        }
+
+        for scratch in &self.scratch_volumes {
+            build_scratch_volume_and_mount(scratch)?;
         }
 
         if let Some(timeout) = self.timeout_seconds {
@@ -321,6 +368,13 @@ mod tests {
                 allowed_cidrs: vec!["10.42.0.0/16".to_string()],
                 allowed_tcp_ports: vec![443],
             }),
+            scratch_volumes: vec![ScratchVolumeSpec::default()],
+            rbac_rules: vec![ScopedRuleSpec {
+                api_group: String::new(),
+                resource: "configmaps".to_string(),
+                resource_names: vec!["agent-cfg".to_string()],
+                verbs: vec!["get".to_string()],
+            }],
         };
 
         let req = spec.validate().expect("valid spec");

@@ -13,10 +13,12 @@ pub mod lifecycle;
 pub mod manifest;
 pub mod network;
 pub mod priority;
+pub mod probes;
 pub mod quantity;
 pub mod quota;
 pub mod rbac;
 pub mod scheduling;
+pub mod secrets;
 pub mod security;
 pub mod selector;
 pub mod storage;
@@ -68,6 +70,10 @@ pub use priority::{
     PreemptionBehavior, PriorityError, WorkloadPriorityTier, DEFAULT_TERMINATION_GRACE_SECONDS,
     FORBIDDEN_SYSTEM_PRIORITY_CLASSES, MAX_TERMINATION_GRACE_SECONDS, MAX_WORKLOAD_PRIORITY_VALUE,
 };
+pub use probes::{
+    audit_pod_probes, build_http_get_probe, evaluate_rollout_quorum, HttpProbeSpec, ProbeError,
+    RolloutQuorumReport, RolloutQuorumSpec,
+};
 pub use quantity::{
     CpuQuantity, MemoryQuantity, QuantityError, ResourceQuotaSpec, ResourceRequest, ResourceUsage,
 };
@@ -85,6 +91,13 @@ pub use scheduling::{
     build_hostname_spread_constraint, build_workload_pdb, build_workload_tolerations,
     IsolationProfile, RUNTIME_CLASS_KATA, TAINT_KEY_AGENT_POOL, TAINT_KEY_GPU,
     TOPOLOGY_KEY_HOSTNAME,
+};
+pub use secrets::{
+    audit_pod_secret_and_token_hygiene, build_immutable_config_map, build_immutable_secret,
+    build_projected_token_volume, compute_kv_content_hash, is_sensitive_env_var_name,
+    BoundTokenProjectionSpec, SecretHygieneError, DEFAULT_PROJECTED_TOKEN_MODE,
+    DEFAULT_TOKEN_EXPIRATION_SECONDS, MAX_TOKEN_EXPIRATION_SECONDS, MIN_TOKEN_EXPIRATION_SECONDS,
+    SENSITIVE_ENV_SUBSTRINGS,
 };
 pub use security::{
     audit_pod_spec_restricted, restricted_container_security_context,
@@ -145,6 +158,14 @@ pub enum SpecValidationError {
     /// Priority tier or termination grace period failed validation.
     #[error("invalid priority or termination grace period in workload spec: {0}")]
     InvalidPriority(#[from] PriorityError),
+
+    /// Secret hygiene or projected token specification failed validation (`SPEC-0006`).
+    #[error("invalid secret or token hygiene in workload spec: {0}")]
+    InvalidSecretHygiene(#[from] SecretHygieneError),
+
+    /// Probe or rollout quorum specification failed validation (`SPEC-0006`).
+    #[error("invalid probe or rollout specification in workload spec: {0}")]
+    InvalidProbe(#[from] ProbeError),
 
     /// Timeout is zero or exceeds [`MAX_TIMEOUT_SECONDS`].
     #[error("timeout_seconds ({0}) must be between 1 and {MAX_TIMEOUT_SECONDS}")]
@@ -242,6 +263,14 @@ impl AgentWorkloadSpec {
         for key in self.env.keys() {
             if key.trim().is_empty() || key.contains('=') {
                 return Err(SpecValidationError::InvalidEnvVarName(key.clone()));
+            }
+            if is_sensitive_env_var_name(key) {
+                return Err(SpecValidationError::InvalidSecretHygiene(
+                    SecretHygieneError::PlaintextSensitiveEnvVar {
+                        container: "agent".to_string(),
+                        env_name: key.clone(),
+                    },
+                ));
             }
         }
 

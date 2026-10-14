@@ -2,11 +2,14 @@
 name = "k8"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-publish = false
-description = "Kubernetes agent orchestrator, workload controller, and native CLI tooling for autonomous agent fleets"
+description = "Kubernetes Agent Workload Orchestrator CLI and Daemon"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "k8"
@@ -16,12 +19,15 @@ path = "src/main.rs"
 k8-core = { workspace = true }
 k8-api = { workspace = true }
 k8-orchestrator = { workspace = true }
-kube = { workspace = true }
-k8s-openapi = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde-saphyr = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }

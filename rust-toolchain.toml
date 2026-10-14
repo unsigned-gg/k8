@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned estate Rust toolchain (matches ci-rust-runner:v0.1.6).
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

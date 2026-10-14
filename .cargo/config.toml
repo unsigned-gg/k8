@@ -1,0 +1,9 @@
+# Sparse registry protocol is default since Rust 1.70; explicit for older toolchains.
+[registries.crates-io]
+protocol = "sparse"
+
+[net]
+git-fetch-with-cli = true
+
+[alias]
+xtask = "run -q -j 2 -p xtask --"

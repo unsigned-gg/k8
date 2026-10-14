@@ -2,23 +2,26 @@
 name = "k8-orchestrator"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-publish = false
-description = "Kubernetes agent orchestrator engine: job scheduler, security jail context, and reaper"
+description = "Agent workload lifecycle orchestrator, PodSecurity hardener, and Kubernetes job reconciler"
+
+[lints]
+workspace = true
 
 [dependencies]
 k8-core = { workspace = true }
 k8-api = { workspace = true }
-kube = { workspace = true }
-k8s-openapi = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
-futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde-saphyr = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

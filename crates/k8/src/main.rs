@@ -2,8 +2,8 @@
 //! `k8` CLI entrypoint.
 
 use clap::{Parser, Subcommand};
-use k8_api::AgentWorkloadSpec;
-use k8_core::{K8Client, Result};
+use k8_api::{AgentWorkload, AgentWorkloadSpec};
+use k8_core::{K8Client, K8Error, Result};
 use k8_orchestrator::Orchestrator;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
@@ -15,11 +15,18 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(name = "k8")]
 #[command(author = "unsigned.gg <engineering@unsigned.gg>")]
 #[command(version = "0.1.0")]
-#[command(about = "Kubernetes agent orchestrator and native CLI tooling for autonomous agent fleets", long_about = None)]
+#[command(
+    about = "Kubernetes agent orchestrator and native CLI tooling for autonomous agent fleets",
+    long_about = None
+)]
 struct Cli {
     /// Kubernetes namespace override
     #[arg(short, long, env = "K8S_NAMESPACE")]
     namespace: Option<String>,
+
+    /// Disable ANSI colors in log and table output
+    #[arg(long, global = true)]
+    plain: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -29,6 +36,9 @@ struct Cli {
 enum Commands {
     /// Inspect cluster health, connected namespace, and agent node status
     Status,
+
+    /// Render the AgentWorkload CustomResourceDefinition (CRD) YAML 1.2 manifest
+    Crd,
 
     /// Dispatch a one-shot autonomous agent container Job
     Run {
@@ -62,6 +72,10 @@ enum Commands {
         /// Agent persona or role label
         #[arg(short, long)]
         role: Option<String>,
+
+        /// Render the validated Kubernetes Job YAML manifest without contacting the cluster
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// List active agent workloads and Jobs
@@ -77,30 +91,30 @@ enum Commands {
     Daemon,
 }
 
+fn should_disable_ansi(plain_flag: bool) -> bool {
+    plain_flag
+        || std::env::var_os("NO_COLOR").is_some()
+        || std::env::var("TERM").is_ok_and(|t| t == "dumb")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let disable_ansi = should_disable_ansi(cli.plain);
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "k8=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(!disable_ansi))
         .init();
 
-    let cli = Cli::parse();
-    let mut client = K8Client::default_client().await?;
-    if let Some(ns) = cli.namespace {
-        client = client.with_namespace(ns);
-    }
-
     match cli.command {
-        Commands::Status => {
-            println!("k8 Kubernetes Orchestrator v0.1.0");
-            println!("Connected namespace: {}", client.namespace());
-            let pods: Api<Pod> = Api::namespaced(client.inner().clone(), client.namespace());
-            let lp = ListParams::default().labels("app.kubernetes.io/managed-by=k8");
-            let pod_list = pods.list(&lp).await?;
-            println!("Active agent pods: {}", pod_list.items.len());
+        Commands::Crd => {
+            let yaml = AgentWorkload::crd_yaml()?;
+            print!("{yaml}");
+            return Ok(());
         }
 
         Commands::Run {
@@ -112,8 +126,8 @@ async fn main() -> Result<()> {
             memory,
             timeout,
             role,
+            dry_run,
         } => {
-            let orch = Orchestrator::new(client);
             let spec = AgentWorkloadSpec {
                 image,
                 command,
@@ -125,51 +139,75 @@ async fn main() -> Result<()> {
                 timeout_seconds: timeout,
                 agent_role: role,
             };
-            let run_id = orch.dispatch(spec).await?;
-            println!("Dispatched agent Job: {}", run_id);
-        }
 
-        Commands::List => {
-            let jobs: Api<Job> = Api::namespaced(client.inner().clone(), client.namespace());
-            let lp = ListParams::default().labels("app.kubernetes.io/managed-by=k8");
-            let job_list = jobs.list(&lp).await?;
-            println!("{:<24} {:<15} {:<10}", "RUN ID", "STATUS", "COMPLETIONS");
-            println!("{:-<52}", "");
-            for job in job_list.items {
-                let name = job.metadata.name.unwrap_or_default();
-                let status = if let Some(s) = job.status {
-                    if s.succeeded.unwrap_or(0) > 0 {
-                        "Succeeded"
-                    } else if s.failed.unwrap_or(0) > 0 {
-                        "Failed"
-                    } else if s.active.unwrap_or(0) > 0 {
-                        "Running"
-                    } else {
-                        "Pending"
-                    }
-                } else {
-                    "Unknown"
-                };
-                println!("{:<24} {:<15} {:<10}", name, status, "");
+            if dry_run {
+                let ns = cli.namespace.as_deref().unwrap_or("default");
+                let yaml = Orchestrator::render_job_yaml("agent-dryrun", ns, &spec)?;
+                print!("{yaml}");
+                return Ok(());
             }
-        }
 
-        Commands::Stop { run_id } => {
+            let mut client = K8Client::default_client().await?;
+            if let Some(ns) = cli.namespace {
+                client = client.with_namespace(ns);
+            }
             let orch = Orchestrator::new(client);
-            orch.terminate(&run_id).await?;
-            println!("Terminated agent Job: {}", run_id);
+            let run_id = orch.dispatch(spec).await?;
+            println!("Dispatched agent Job: {run_id}");
+            return Ok(());
         }
 
-        Commands::Daemon => {
-            println!(
-                "Starting k8 agent orchestrator daemon in namespace: {}",
-                client.namespace()
-            );
-            println!("Listening for autonomous agent workload CRDs and job signals...");
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to listen for event");
-            println!("Received shutdown signal. Exiting k8 daemon.");
+        other => {
+            let mut client = K8Client::default_client().await?;
+            if let Some(ns) = cli.namespace {
+                client = client.with_namespace(ns);
+            }
+
+            match other {
+                Commands::Status => {
+                    println!("k8 Kubernetes Orchestrator v0.1.0");
+                    println!("Connected namespace: {}", client.namespace());
+                    let pods: Api<Pod> =
+                        Api::namespaced(client.inner().clone(), client.namespace());
+                    let lp = ListParams::default().labels("app.kubernetes.io/managed-by=k8");
+                    let pod_list = pods.list(&lp).await?;
+                    println!("Active agent pods: {}", pod_list.items.len());
+                }
+
+                Commands::List => {
+                    let jobs: Api<Job> =
+                        Api::namespaced(client.inner().clone(), client.namespace());
+                    let lp = ListParams::default().labels("app.kubernetes.io/managed-by=k8");
+                    let job_list = jobs.list(&lp).await?;
+                    println!("{:<24} {:<15} {:<10}", "RUN ID", "STATUS", "COMPLETIONS");
+                    println!("{:-<52}", "");
+                    for job in job_list.items {
+                        let phase = Orchestrator::evaluate_job_phase(&job);
+                        let name = job.metadata.name.unwrap_or_default();
+                        println!("{name:<24} {phase:?}");
+                    }
+                }
+
+                Commands::Stop { run_id } => {
+                    let orch = Orchestrator::new(client);
+                    orch.terminate(&run_id).await?;
+                    println!("Terminated agent Job: {run_id}");
+                }
+
+                Commands::Daemon => {
+                    println!(
+                        "Starting k8 agent orchestrator daemon in namespace: {}",
+                        client.namespace()
+                    );
+                    println!("Listening for autonomous agent workload CRDs and job signals...");
+                    tokio::signal::ctrl_c().await.map_err(|e| {
+                        K8Error::Config(format!("failed to listen for shutdown signal: {e}"))
+                    })?;
+                    println!("Received shutdown signal. Exiting k8 daemon.");
+                }
+
+                Commands::Crd | Commands::Run { .. } => {}
+            }
         }
     }
 

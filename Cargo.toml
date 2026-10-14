@@ -1,39 +1,74 @@
 [workspace]
+resolver = "2"
 members = [
     "crates/k8",
-    "crates/k8-core",
-    "crates/k8-api",
     "crates/k8-orchestrator",
+    "crates/k8-api",
+    "crates/k8-core",
+    "xtask",
 ]
-resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0 OR MIT"
-authors = ["unsigned.gg <engineering@unsigned.gg>", "Christian M. Todie <chris@todie.io>"]
+authors = ["Unsigned Engineering <eng@unsigned.gg>"]
 repository = "https://github.com/unsigned-gg/k8"
 homepage = "https://unsigned.gg"
-documentation = "https://docs.rs/k8"
-readme = "README.md"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+unnecessary_map_or = "warn"
 
 [workspace.dependencies]
+# Internal Crates
 k8-core = { path = "crates/k8-core", version = "0.1.0" }
 k8-api = { path = "crates/k8-api", version = "0.1.0" }
 k8-orchestrator = { path = "crates/k8-orchestrator", version = "0.1.0" }
 
-kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive"] }
-k8s-openapi = { version = "0.28.0", features = ["latest"] }
+# Async & Runtime
 tokio = { version = "1.43", features = ["full"] }
 futures = "0.3"
-futures-util = "0.3"
+
+# Serialization & YAML (serde-saphyr: safe YAML 1.2 Serde engine, #![forbid(unsafe_code)])
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
-clap = { version = "4.5", features = ["derive", "env"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde-saphyr = "0.0.29"
+json-patch = "4.2"
+schemars = "1.2"
+
+# Error Handling & Telemetry
 thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Kubernetes Ecosystem
+kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive"] }
+k8s-openapi = { version = "0.28.0", features = ["latest"] }
+
+# Time & Identifiers
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.release]
+lto = true
+codegen-units = 1
